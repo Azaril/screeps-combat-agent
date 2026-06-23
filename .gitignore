@@ -1,0 +1,4 @@
+# Build artifacts
+/target
+# Resolved lockfile (this crate is a library; consumers pin their own)
+Cargo.lock
