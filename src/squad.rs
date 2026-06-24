@@ -13,7 +13,7 @@ use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_decision::{
     cohesion, decide_combat, decide_movement, decide_squad_with_pathing,
     kite::{SquadTacticParams, MAX_KITE_OPS},
-    CreepOrders, FocusTarget, SquadMemberView, SquadOrderState, SquadStateDto, SquadView,
+    CombatIntent, CreepOrders, FocusTarget, SquadMemberView, SquadOrderState, SquadStateDto, SquadView,
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
 use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority};
@@ -250,6 +250,26 @@ impl ManagedSimSquad {
     /// with the shared directive, returning the engine [`Intents`].
     pub fn step(&mut self, world: &CombatWorld) -> Intents {
         let room = self.objective.room_name();
+
+        // TRAVEL phase (cross-room): the in-room `SimView` below is scoped to the objective room, so a
+        // squad whose members are still in another room would be invisible to it (no intents → no
+        // movement). Until the whole living squad has crossed into the objective room, path it there via
+        // the per-creep rover (which crosses borders); the in-room combat brain runs only once arrived.
+        let living_ids: Vec<CreepId> = self.members.iter().copied().filter(|&id| world.creeps.iter().any(|c| c.id == id && c.is_alive())).collect();
+        if living_ids.is_empty() {
+            return Intents::new();
+        }
+        let in_objective_room = |id: CreepId| world.creeps.iter().any(|c| c.id == id && c.is_alive() && c.pos.room_name() == room);
+        if !living_ids.iter().copied().all(in_objective_room) {
+            let mut intents = Intents::new();
+            let goal = CombatIntent::MoveTo { target: self.objective, range: 1 };
+            let reqs: Vec<SimMoveRequest> = living_ids.iter().filter_map(|&id| SimMoveRequest::from_intent(id, &goal)).collect();
+            for (id, dir) in resolve_moves_via_system(world, self.owner, &reqs, &mut self.move_cache) {
+                intents.set_move(id, dir);
+            }
+            return intents;
+        }
+
         let sim = SimView::from_world(world, self.owner, self.objective, room);
 
         // Living members in slot order — `member_views` and the decision index by THIS list.
@@ -366,6 +386,31 @@ mod tests {
             loose: false,
             move_cache: SimMoveCache::default(),
         }
+    }
+
+    #[test]
+    fn managed_squad_travels_across_a_room_border() {
+        // Two ranged movers near the WEST edge of W1N1; the objective is just across the border in the
+        // west neighbour W2N1. The travel mode must path the managed squad across (the room-scoped view
+        // alone can't — the operator-flagged "no cross-room movement").
+        let w2: RoomName = "W2N1".parse().unwrap();
+        let p2 = |x: u8, y: u8| Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), w2);
+        let mut world = CombatWorld {
+            creeps: vec![
+                SimCreep { id: 1, owner: 0, pos: pos(3, 25), body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]), fatigue: 0 },
+                SimCreep { id: 2, owner: 0, pos: pos(3, 26), body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]), fatigue: 0 },
+            ],
+            ..Default::default()
+        };
+        let mut squad = ManagedSimSquad::new(0, vec![1, 2], p2(40, 25));
+        for _ in 0..150 {
+            let i = squad.step(&world);
+            resolve_tick(&mut world, &i);
+            if world.creeps.iter().all(|c| c.pos.room_name() == w2) {
+                break;
+            }
+        }
+        assert!(world.creeps.iter().any(|c| c.pos.room_name() == w2), "the managed squad crossed W1N1 → W2N1 (travel mode)");
     }
 
     #[test]
