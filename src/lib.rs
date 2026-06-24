@@ -20,6 +20,7 @@ pub mod opponents;
 pub mod pathing;
 pub mod replay;
 pub mod scenario;
+pub mod scenarios;
 pub mod squad;
 
 use screeps::{Part, Position, RawObjectId, RoomName, StructureType};
