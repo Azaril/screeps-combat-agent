@@ -37,6 +37,16 @@ impl ScenarioBuilder {
         Self { world: CombatWorld::default(), room, next_struct_id: STRUCT_ID_BASE }
     }
 
+    /// Switch the builder's **current room** — subsequent terrain / structure / tower calls target
+    /// `room`. Enables multi-room scenarios (ADR 0023 S3): `.in_room(b).wall(..).tower(..)`. Each
+    /// room's terrain goes to its own override (`terrain_mut`), so distinct rooms get distinct terrain;
+    /// `terrain_for` of an unbuilt room stays the (empty) default. Creeps for other rooms go through
+    /// [`world_mut`](Self::world_mut) (the single-room `from_units` seed covers the first room).
+    pub fn in_room(mut self, room: RoomName) -> Self {
+        self.room = room;
+        self
+    }
+
     /// In-room position, clamped to 0..=49 so a synthesized tile can never panic `RoomCoordinate::new`.
     fn pos(&self, x: u8, y: u8) -> Position {
         let cx = RoomCoordinate::new(x.min(ROOM_MAX)).expect("clamped <= 49");
@@ -51,30 +61,34 @@ impl ScenarioBuilder {
 
     // ── terrain ──
     pub fn wall(mut self, x: u8, y: u8) -> Self {
-        self.world.terrain.walls.insert((x.min(ROOM_MAX), y.min(ROOM_MAX)));
+        let room = self.room;
+        self.world.terrain_mut(room).walls.insert((x.min(ROOM_MAX), y.min(ROOM_MAX)));
         self
     }
     /// A full wall column at `x`, with an optional passable gap `(lo..=hi)` in y (a choke/door).
     pub fn wall_column(mut self, x: u8, gap: Option<(u8, u8)>) -> Self {
+        let room = self.room;
         for y in 0..=ROOM_MAX {
             if !gap.is_some_and(|(lo, hi)| y >= lo && y <= hi) {
-                self.world.terrain.walls.insert((x.min(ROOM_MAX), y));
+                self.world.terrain_mut(room).walls.insert((x.min(ROOM_MAX), y));
             }
         }
         self
     }
     pub fn wall_row(mut self, y: u8, gap: Option<(u8, u8)>) -> Self {
+        let room = self.room;
         for x in 0..=ROOM_MAX {
             if !gap.is_some_and(|(lo, hi)| x >= lo && x <= hi) {
-                self.world.terrain.walls.insert((x, y.min(ROOM_MAX)));
+                self.world.terrain_mut(room).walls.insert((x, y.min(ROOM_MAX)));
             }
         }
         self
     }
     pub fn swamp_rect(mut self, x0: u8, y0: u8, x1: u8, y1: u8) -> Self {
+        let room = self.room;
         for y in y0.min(ROOM_MAX)..=y1.min(ROOM_MAX) {
             for x in x0.min(ROOM_MAX)..=x1.min(ROOM_MAX) {
-                self.world.terrain.swamps.insert((x, y));
+                self.world.terrain_mut(room).swamps.insert((x, y));
             }
         }
         self
@@ -153,10 +167,12 @@ mod tests {
     #[test]
     fn wall_column_leaves_a_gap() {
         let w = ScenarioBuilder::empty(room()).wall_column(25, Some((24, 26))).build();
-        assert!(w.terrain.walls.contains(&(25, 10)), "wall above the gap");
-        assert!(w.terrain.walls.contains(&(25, 40)), "wall below the gap");
-        assert!(!w.terrain.walls.contains(&(25, 25)), "gap is passable");
-        assert_eq!(w.terrain.walls.iter().filter(|(x, _)| *x == 25).count(), 47, "50 tiles minus a 3-wide gap");
+        // Terrain now lives in the room's override (S3 multi-room); read via terrain_for.
+        let t = w.terrain_for(room());
+        assert!(t.walls.contains(&(25, 10)), "wall above the gap");
+        assert!(t.walls.contains(&(25, 40)), "wall below the gap");
+        assert!(!t.walls.contains(&(25, 25)), "gap is passable");
+        assert_eq!(t.walls.iter().filter(|(x, _)| *x == 25).count(), 47, "50 tiles minus a 3-wide gap");
     }
 
     #[test]

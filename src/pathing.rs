@@ -7,7 +7,7 @@
 //! (ADR 0006 §B.2). Real pathfinding, not a greedy stepper: a kiter routes *around* obstacles.
 
 use screeps::local::LocalCostMatrix;
-use screeps::{Direction, Position, RoomName};
+use screeps::{Direction, Position, RoomCoordinate, RoomName};
 use screeps_combat_decision::CombatIntent;
 use screeps_combat_engine::{CombatWorld, PlayerId};
 use screeps_rover::{
@@ -39,22 +39,27 @@ struct CombatCostSource {
 
 impl CombatCostSource {
     fn from_world(world: &CombatWorld, room: RoomName, me_owner: PlayerId) -> Self {
+        // Room-scoped (S3): only obstacles IN `room` populate `room`'s matrix — a structure/creep at
+        // (x,y) in a *different* room must not block (x,y) here, and terrain reads the room's own
+        // override (`terrain_for`). Without this, the multi-room search saw every room's obstacles
+        // overlaid at the same (x,y), so it could never route across a border.
         let mut blockers = Vec::new();
-        for s in world.structures.iter().filter(|s| s.is_alive()) {
+        for s in world.structures.iter().filter(|s| s.is_alive() && s.pos.room_name() == room) {
             blockers.push((s.pos.x().u8(), s.pos.y().u8()));
         }
-        for t in world.towers.iter().filter(|t| t.is_alive()) {
+        for t in world.towers.iter().filter(|t| t.is_alive() && t.pos.room_name() == room) {
             blockers.push((t.pos.x().u8(), t.pos.y().u8()));
         }
+        let terrain = world.terrain_for(room);
         Self {
             room,
-            walls: world.terrain.walls.iter().copied().collect(),
-            swamps: world.terrain.swamps.iter().copied().collect(),
+            walls: terrain.walls.iter().copied().collect(),
+            swamps: terrain.swamps.iter().copied().collect(),
             blockers,
             hostiles: world
                 .creeps
                 .iter()
-                .filter(|c| c.is_alive() && c.owner != me_owner)
+                .filter(|c| c.is_alive() && c.owner != me_owner && c.pos.room_name() == room)
                 .map(|c| (c.pos.x().u8(), c.pos.y().u8()))
                 .collect(),
         }
@@ -107,10 +112,34 @@ pub fn build_combat_matrix(world: &CombatWorld, room: RoomName, me_owner: Player
     system.build_local_cost_matrix(room, &CostMatrixOptions::default()).ok()
 }
 
+/// Project a (possibly cross-room) `target` onto `from`'s current room (ADR 0023 S3 "MoveToRoom"):
+/// for a same-room target, the target itself; for a cross-room target, the target's world position
+/// **clamped to the current room** — i.e. the room-edge tile that points toward the target's room.
+/// The headless [`LocalPathfinder`] is single-room (cross-room travel is a separate MoveToRoom phase,
+/// like the live bot's `find_route` + move-to-exit), so the creep routes to that exit tile and the
+/// engine's edge-exit relocation (`resolve_tick` Phase D) carries it across; the next room re-projects.
+fn in_room_goal(from: Position, target: Position) -> Position {
+    if from.room_name() == target.room_name() {
+        return target;
+    }
+    let (fwx, fwy) = from.world_coords();
+    let (twx, twy) = target.world_coords();
+    let origin_x = fwx - from.x().u8() as i32; // the current room's world-coord origin
+    let origin_y = fwy - from.y().u8() as i32;
+    let lx = (twx - origin_x).clamp(0, 49) as u8;
+    let ly = (twy - origin_y).clamp(0, 49) as u8;
+    Position::new(
+        RoomCoordinate::new(lx).expect("clamped 0..=49"),
+        RoomCoordinate::new(ly).expect("clamped 0..=49"),
+        from.room_name(),
+    )
+}
+
 /// Resolve a movement goal to the next-step [`Direction`] from `from` (owned by `me_owner`), via
 /// rover's pathfinder over the `CombatWorld`. Returns `None` for non-movement intents, when already
 /// satisfied (empty path), or when no route exists. Combat intents (`Attack`/`Heal`/…) and `Idle`
-/// yield `None` here.
+/// yield `None` here. **Cross-room `MoveTo`** routes to the room-edge tile toward the target (see
+/// [`in_room_goal`]); the engine's edge-exit carries the creep across, then the next room re-projects.
 pub fn resolve_move_direction(
     world: &CombatWorld,
     from: Position,
@@ -123,7 +152,11 @@ pub fn resolve_move_direction(
 
     let result = match intent {
         CombatIntent::MoveTo { target, range } => {
-            pf.search(from, *target, *range as u32, &mut room_cb, MAX_OPS, opts.plains_cost, opts.swamp_cost)
+            // Single-room search to the in-room goal: the target if same-room, else the edge tile
+            // toward the target's room (range 0 — reach the exit exactly so the edge-exit fires).
+            let goal = in_room_goal(from, *target);
+            let goal_range = if goal == *target { *range as u32 } else { 0 };
+            pf.search(from, goal, goal_range, &mut room_cb, MAX_OPS, opts.plains_cost, opts.swamp_cost)
         }
         CombatIntent::Flee { from: threats, range } => {
             let goals: Vec<(Position, u32)> = threats.iter().map(|p| (*p, *range as u32)).collect();
@@ -139,13 +172,20 @@ pub fn resolve_move_direction(
 mod tests {
     use super::*;
     use screeps::{Part, RoomCoordinate};
-    use screeps_combat_engine::{CombatWorld, SimBody, SimCreep};
+    use screeps_combat_engine::{resolve_tick, CombatWorld, Intents, SimBody, SimCreep};
 
     fn room() -> RoomName {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
         Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+    }
+    /// The room one step east of W1N1, derived via `checked_add` (no hardcoded W0/W2).
+    fn east_room() -> RoomName {
+        pos(49, 25).checked_add((1, 0)).unwrap().room_name()
+    }
+    fn pos_in(r: RoomName, x: u8, y: u8) -> Position {
+        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), r)
     }
     fn creep(id: u32, x: u8, y: u8) -> SimCreep {
         SimCreep {
@@ -213,5 +253,46 @@ mod tests {
     fn non_movement_intent_is_none() {
         let world = CombatWorld { creeps: vec![creep(1, 5, 25)], ..Default::default() };
         assert_eq!(resolve_move_direction(&world, pos(5, 25), 0, &CombatIntent::Idle), None);
+    }
+
+    // ── Cross-room direction production (ADR 0023 S3) ─────────────────────────────────────────────
+
+    #[test]
+    fn aims_toward_the_exit_for_a_cross_room_target() {
+        // A target in the adjacent (east) room → the next step heads east toward the exit. The rover's
+        // multi-room search routes across once the cost source is room-scoped (S3); previously every
+        // room's obstacles overlaid at the same (x,y) so it could not route across a border.
+        let east = pos_in(east_room(), 25, 25);
+        let world = CombatWorld { creeps: vec![creep(1, 25, 25)], ..Default::default() };
+        let dir = resolve_move_direction(&world, pos(25, 25), 0, &CombatIntent::MoveTo { target: east, range: 0 })
+            .expect("a cross-room route exists");
+        assert!(
+            matches!(dir, Direction::Right | Direction::TopRight | Direction::BottomRight),
+            "heads east toward the exit, got {:?}",
+            dir
+        );
+    }
+
+    #[test]
+    fn paths_a_creep_across_a_room_boundary() {
+        // End-to-end: resolve_move_direction picks each next step toward a target in the EAST room;
+        // resolve_tick applies the move AND the engine's edge-exit relocation. The creep crosses the
+        // border and arrives — the full S3 cross-room movement path, validated against the engine.
+        let target = pos_in(east_room(), 5, 25);
+        let mut world = CombatWorld { creeps: vec![creep(1, 45, 25)], ..Default::default() };
+        let mut reached = false;
+        for _ in 0..40 {
+            let from = world.creeps[0].pos;
+            if from == target {
+                reached = true;
+                break;
+            }
+            let mut i = Intents::new();
+            if let Some(dir) = resolve_move_direction(&world, from, 0, &CombatIntent::MoveTo { target, range: 0 }) {
+                i.set_move(1, dir);
+            }
+            resolve_tick(&mut world, &i);
+        }
+        assert!(reached, "the creep pathed across the border into the east room and reached the target");
     }
 }

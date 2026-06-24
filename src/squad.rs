@@ -445,10 +445,9 @@ mod tests {
         // (decide_squad_with_pathing → per-creep decide_movement). The squad should advance to its
         // pathfinding-scored kite goal (shooting range, clear of the keeper's melee reach), stay
         // cohesive (ONE shared goal → the block doesn't separate), and chip the keeper while surviving.
-        let keeper_body: Vec<Part> = std::iter::repeat(Part::Attack)
-            .take(5)
-            .chain(std::iter::repeat(Part::Move).take(5))
-            .chain(std::iter::repeat(Part::Tough).take(10))
+        let keeper_body: Vec<Part> = std::iter::repeat_n(Part::Attack, 5)
+            .chain(std::iter::repeat_n(Part::Move, 5))
+            .chain(std::iter::repeat_n(Part::Tough, 10))
             .collect();
         let keeper = SimCreep { id: 99, owner: 1, pos: pos(25, 25), body: SimBody::unboosted(&keeper_body), fatigue: 0 };
         let ra_body = [Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::Move, Part::Move, Part::Move, Part::Move, Part::Move];
