@@ -25,15 +25,26 @@ const ADVANCE_QUORUM: f32 = 0.75;
 /// Loose-mode (blob / corridor) cohesion radius — members within this of the anchor are gathered.
 const LOOSE_RADIUS: u32 = 3;
 
-/// `anchor + (dx,dy)`, clamped out if it leaves the room.
-fn offset_pos(anchor: Position, (dx, dy): (i32, i32)) -> Option<Position> {
-    let x = anchor.x().u8() as i32 + dx;
-    let y = anchor.y().u8() as i32 + dy;
-    if (0..50).contains(&x) && (0..50).contains(&y) {
-        Some(Position::new(RoomCoordinate::new(x as u8).ok()?, RoomCoordinate::new(y as u8).ok()?, anchor.room_name()))
-    } else {
-        None
-    }
+/// `anchor + (dx,dy)`, with an off-room offset **folded** back into the room (mirrored). Near a room
+/// edge a formation's far slots would land off-map; folding keeps them as DISTINCT in-room tiles so
+/// members spread out instead of stacking on the anchor — the sim's engine `movement.check` has no
+/// shoving (that traffic management is the live rover resolver), so converging on one tile piles up.
+fn offset_pos(anchor: Position, (dx, dy): (i32, i32)) -> Position {
+    let fold = |c: i32, o: i32| {
+        let v = c + o;
+        if (0..50).contains(&v) {
+            v
+        } else {
+            (c - o).clamp(0, 49) // off-map → mirror the offset back inside
+        }
+    };
+    let x = fold(anchor.x().u8() as i32, dx);
+    let y = fold(anchor.y().u8() as i32, dy);
+    Position::new(
+        RoomCoordinate::new(x as u8).expect("0..=49"),
+        RoomCoordinate::new(y as u8).expect("0..=49"),
+        anchor.room_name(),
+    )
 }
 
 /// A squad in the sim: an anchor mover + ordered members (member `i` holds `layout[i]`).
@@ -73,6 +84,15 @@ impl SimSquad {
             .collect()
     }
 
+    /// Living member positions read from the WHOLE world (any room) — used for the cross-edge gate,
+    /// where members straddle the border and the anchor's single-room [`SimView`] can't see them all.
+    fn all_member_positions(&self, world: &CombatWorld) -> Vec<Position> {
+        self.members
+            .iter()
+            .filter_map(|&id| world.creeps.iter().find(|c| c.id == id && c.is_alive()).map(|c| c.pos))
+            .collect()
+    }
+
     /// Advance the squad one tick. Measures cohesion against the current anchor; advances the
     /// anchor toward the objective only if a quorum is in formation (else holds for stragglers);
     /// then moves each member toward its formation slot and emits seam combat. Returns the engine
@@ -99,7 +119,11 @@ impl SimSquad {
 
         // Gate: a strung-out (loose) squad or a blob advances on centroid proximity (so it can keep
         // threading / re-gathering); a formed box advances only when actually in box formation.
-        let cohesive = if blob || self.loose {
+        // Cross-edge cohesion (P-MOVE): before the anchor steps across a room border, HOLD (pre-group)
+        // until a quorum has clustered at the exit (members fold into distinct in-room slots there),
+        // then advance to cross as a bloc — so they aren't strung out across the boundary and picked
+        // off one-by-one. Otherwise the normal gate (loose/blob on centroid, a box on box formation).
+        let cohesive = if self.anchor.next_step_crosses_room() || blob || self.loose {
             near_anchor >= ADVANCE_QUORUM
         } else {
             box_rate >= ADVANCE_QUORUM
@@ -126,36 +150,54 @@ impl SimSquad {
 
         // Move members: box → exact slot; loose (blob / corridor) → clump near the anchor (they
         // queue single-file through a 1-wide corridor). Fight via the seam regardless.
-        let anchor = self.anchor.virtual_pos;
+        let anchor = self.anchor.virtual_pos; // post-advance (may have crossed a border)
+        // While crossing/straddling a border, members CONVERGE on the anchor (range 1) instead of
+        // holding box slots: the box slots straddle the boundary (some clamp off-room), so converging
+        // gathers the bloc at the exit (pre-group) and pulls stragglers across after it (bulk-cross).
+        let straddling = self
+            .all_member_positions(world)
+            .iter()
+            .any(|p| p.room_name() != anchor.room_name());
+        // Crossing/straddling a border → hold DISTINCT folded slots (NOT converge on the anchor: that
+        // piles up, the sim has no shoving). A genuine 1-wide corridor still single-files behind it.
+        let crossing = self.anchor.next_step_crosses_room() || straddling;
         let mut intents = Intents::new();
         for (slot, &member_id) in self.members.iter().enumerate() {
-            let Some(fi) = sim.friend_index(member_id) else {
+            // Position from the WHOLE world (any room): a member that has, or hasn't yet, crossed the
+            // border still gets a move toward the anchor — the anchor's single-room `SimView` can't
+            // see across the boundary, which would otherwise freeze straddling members mid-cross.
+            let Some(me_pos) = world
+                .creeps
+                .iter()
+                .find(|c| c.id == member_id && c.is_alive())
+                .map(|c| c.pos)
+            else {
                 continue;
             };
-            let me_pos = sim.friends()[fi].pos;
 
-            let actions: Vec<_> = decide_combat(&sim.view_for(fi))
-                .iter()
-                .filter_map(|ci| to_engine_action(ci, &sim))
-                .collect();
-            if !actions.is_empty() {
-                intents.set(member_id, actions);
+            // Combat decision needs the local view → only for members in the anchor's room.
+            if let Some(fi) = sim.friend_index(member_id) {
+                let actions: Vec<_> = decide_combat(&sim.view_for(fi))
+                    .iter()
+                    .filter_map(|ci| to_engine_action(ci, &sim))
+                    .collect();
+                if !actions.is_empty() {
+                    intents.set(member_id, actions);
+                }
             }
 
-            // Member target by mode: a corridor (loose, not a blob) tight-follows the anchor
-            // single-file (its box slots are walls); a blob spreads to its slots loosely (range 1);
-            // the box holds exact slots (range 0).
-            let goal = if loose && !blob {
-                Some(CombatIntent::MoveTo { target: anchor, range: 1 })
+            // Member target by mode: a true 1-wide corridor single-files behind the anchor; a box, a
+            // blob, or a border-crossing squad holds DISTINCT (folded) formation slots so members
+            // spread to separate tiles (range 1 when loose/crossing, exact when a tight box).
+            let goal = if loose && !blob && !crossing {
+                CombatIntent::MoveTo { target: anchor, range: 1 }
             } else {
                 let offset = self.layout.get(slot).copied().unwrap_or((0, 0));
-                let range = if loose { 1 } else { 0 };
-                offset_pos(anchor, offset).map(|slot_pos| CombatIntent::MoveTo { target: slot_pos, range })
+                let range = if loose || crossing { 1 } else { 0 };
+                CombatIntent::MoveTo { target: offset_pos(anchor, offset), range }
             };
-            if let Some(g) = goal {
-                if let Some(dir) = resolve_move_direction(world, me_pos, self.owner, &g) {
-                    intents.set_move(member_id, dir);
-                }
+            if let Some(dir) = resolve_move_direction(world, me_pos, self.owner, &goal) {
+                intents.set_move(member_id, dir);
             }
         }
         (intents, outcome)
@@ -327,6 +369,39 @@ mod tests {
         // The anchor reached the objective and the squad never fell apart.
         assert!(squad.anchor.virtual_pos.x().u8() >= 38, "squad advanced to the objective");
         assert!(worst_in_formation >= 0.75, "stayed cohesive throughout (worst {})", worst_in_formation);
+    }
+
+    #[test]
+    fn a_quad_crosses_a_room_border_as_a_bloc() {
+        // P-MOVE cross-edge cohesion: a 2×2 quad near the east border of W1N1, objective in the room
+        // to the east. It pre-groups at the exit and crosses as a bloc — all four end in the east
+        // room and the pairwise spread stays bounded through the crossing (not strung out one-by-one
+        // across the border, which is where a scattered squad gets picked off).
+        let east = pos(49, 25).checked_add((1, 0)).unwrap().room_name();
+        let objective = Position::new(RoomCoordinate::new(20).unwrap(), RoomCoordinate::new(25).unwrap(), east);
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 44, 24), creep(2, 45, 24), creep(3, 44, 25), creep(4, 45, 25)],
+            ..Default::default()
+        };
+        let mut squad = quad_squad(pos(44, 24), objective);
+        let mut worst_spread = 0u32;
+        let mut all_in_east = false;
+        for _ in 0..100 {
+            let (intents, _) = squad.step(&world);
+            resolve_tick(&mut world, &intents);
+            let positions = squad.all_member_positions(&world);
+            for i in 0..positions.len() {
+                for j in (i + 1)..positions.len() {
+                    worst_spread = worst_spread.max(positions[i].get_range_to(positions[j]));
+                }
+            }
+            if positions.len() == 4 && positions.iter().all(|p| p.room_name() == east) {
+                all_in_east = true;
+                break;
+            }
+        }
+        assert!(all_in_east, "the whole quad crossed the border into the east room");
+        assert!(worst_spread <= 8, "the quad crossed as a bloc, never strung out (worst spread {})", worst_spread);
     }
 
     #[test]
