@@ -263,8 +263,15 @@ impl CombatWorldCostSource {
         for c in world.creeps.iter().filter(|c| c.is_alive() && c.owner != me_owner) {
             rooms.entry(c.pos.room_name()).or_default().hostiles.push((c.pos.x().u8(), c.pos.y().u8()));
         }
-        // Terrain for every room with content, plus any explicit per-room override.
-        let names: Vec<RoomName> = rooms.keys().copied().chain(world.rooms.keys().copied()).collect();
+        // Terrain for every room that matters — any structure/tower/hostile room (above), any explicit
+        // per-room override, AND every (friendly or hostile) creep's room: a room with only friendly
+        // creeps + walls must still carry its terrain, or the movers would path straight through it.
+        let names: Vec<RoomName> = rooms
+            .keys()
+            .copied()
+            .chain(world.rooms.keys().copied())
+            .chain(world.creeps.iter().filter(|c| c.is_alive()).map(|c| c.pos.room_name()))
+            .collect();
         for name in names {
             let terrain = world.terrain_for(name);
             let entry = rooms.entry(name).or_default();

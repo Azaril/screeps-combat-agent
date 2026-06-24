@@ -7,13 +7,13 @@
 //! routes the squad's W×H box around walls; a [`AnchorOutcome::Blocked`] anchor surfaces a path
 //! failure for the owner to respond to.
 
-use crate::pathing::{build_combat_matrix, resolve_move_direction};
+use crate::pathing::{build_combat_matrix, resolve_move_direction, resolve_moves_via_system, SimMoveCache, SimMoveRequest};
 use crate::{to_engine_action, SimView};
 use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_decision::{
     cohesion, decide_combat, decide_movement, decide_squad_with_pathing,
     kite::{SquadTacticParams, MAX_KITE_OPS},
-    CombatIntent, CreepOrders, FocusTarget, SquadMemberView, SquadOrderState, SquadStateDto, SquadView,
+    CreepOrders, FocusTarget, SquadMemberView, SquadOrderState, SquadStateDto, SquadView,
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
 use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder};
@@ -60,6 +60,9 @@ pub struct SimSquad {
     /// single-file and stays loose (gated on centroid, not box formation) until it re-gathers into
     /// the box on open terrain. A blob (N>4) is always loose regardless.
     pub loose: bool,
+    /// Per-creep movement state (cached path + stuck tracking) for the rover `MovementSystem`,
+    /// persisted across ticks so path reuse + the resolver's stuck-escalation accumulate (matches live).
+    move_cache: SimMoveCache,
 }
 
 impl SimSquad {
@@ -162,18 +165,12 @@ impl SimSquad {
         // piles up, the sim has no shoving). A genuine 1-wide corridor still single-files behind it.
         let crossing = self.anchor.next_step_crosses_room() || straddling;
         let mut intents = Intents::new();
+        let mut move_reqs: Vec<SimMoveRequest> = Vec::new();
         for (slot, &member_id) in self.members.iter().enumerate() {
-            // Position from the WHOLE world (any room): a member that has, or hasn't yet, crossed the
-            // border still gets a move toward the anchor — the anchor's single-room `SimView` can't
-            // see across the boundary, which would otherwise freeze straddling members mid-cross.
-            let Some(me_pos) = world
-                .creeps
-                .iter()
-                .find(|c| c.id == member_id && c.is_alive())
-                .map(|c| c.pos)
-            else {
+            // Skip dead/gone members entirely (no combat, no move request).
+            if !world.creeps.iter().any(|c| c.id == member_id && c.is_alive()) {
                 continue;
-            };
+            }
 
             // Combat decision needs the local view → only for members in the anchor's room.
             if let Some(fi) = sim.friend_index(member_id) {
@@ -189,16 +186,20 @@ impl SimSquad {
             // Member target by mode: a true 1-wide corridor single-files behind the anchor; a box, a
             // blob, or a border-crossing squad holds DISTINCT (folded) formation slots so members
             // spread to separate tiles (range 1 when loose/crossing, exact when a tight box).
-            let goal = if loose && !blob && !crossing {
-                CombatIntent::MoveTo { target: anchor, range: 1 }
+            let (target, range) = if loose && !blob && !crossing {
+                (anchor, 1)
             } else {
                 let offset = self.layout.get(slot).copied().unwrap_or((0, 0));
-                let range = if loose || crossing { 1 } else { 0 };
-                CombatIntent::MoveTo { target: offset_pos(anchor, offset), range }
+                (offset_pos(anchor, offset), if loose || crossing { 1 } else { 0 })
             };
-            if let Some(dir) = resolve_move_direction(world, me_pos, self.owner, &goal) {
-                intents.set_move(member_id, dir);
-            }
+            move_reqs.push(SimMoveRequest { creep: member_id, target, range });
+        }
+        // ONE traffic-managed pass: route every member through rover's `MovementSystem` + resolver
+        // (swaps / shoves / stuck-escalation), the same mover the live bot uses, then apply the
+        // resolved directions. The folded slots above give a good (distinct) target geometry; the
+        // resolver deconflicts whatever collisions remain — sim ≡ live.
+        for (id, dir) in resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache) {
+            intents.set_move(id, dir);
         }
         (intents, outcome)
     }
@@ -344,6 +345,7 @@ mod tests {
             anchor: AnchorPath::new(anchor, objective),
             objective,
             loose: false,
+            move_cache: SimMoveCache::default(),
         }
     }
 
@@ -566,6 +568,7 @@ mod tests {
             anchor: AnchorPath::new(pos(5, 25), pos(30, 25)),
             objective: pos(30, 25),
             loose: false,
+            move_cache: SimMoveCache::default(),
         };
         for _ in 0..90 {
             let (intents, _) = squad.step(&world);
