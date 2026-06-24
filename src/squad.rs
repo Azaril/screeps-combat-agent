@@ -231,6 +231,9 @@ pub struct ManagedSimSquad {
     /// no headway on it. Past [`STALL_LIMIT`] the squad reports `enemy_stalled` (disengage under Destroy).
     prev_enemy_hits: Option<u32>,
     stall_ticks: u32,
+    /// Whether the resolver may shove/swap others to reach a tile (the rover default). Off = A/B the
+    /// effect of shoving on positioning (the investigated control).
+    shove_enabled: bool,
 }
 
 /// Consecutive no-enemy-HP-progress ticks before a Destroy squad treats the fight as a stalemate and
@@ -250,7 +253,15 @@ impl ManagedSimSquad {
             intent: EngageObjective::Destroy,
             prev_enemy_hits: None,
             stall_ticks: 0,
+            shove_enabled: true,
         }
+    }
+
+    /// Enable/disable shoving for this squad's moves (the investigated control — A/B shoving's effect on
+    /// positioning). Default on (the rover default).
+    pub fn with_shove(mut self, shove: bool) -> Self {
+        self.shove_enabled = shove;
+        self
     }
 
     /// Override the position-scoring weights (the EXP-* sweep loop, ADR 0019 Stage 4).
@@ -378,10 +389,22 @@ impl ManagedSimSquad {
             // shared resolver mover with everyone else's so the manager squad gets traffic management.
             // Combat creeps take HIGH priority so they win the forward (shooting) tile over support —
             // otherwise the resolver's neutral tie-break can park the shooter one tile out of range.
-            if let Some(req) = decide_movement(&view_i).iter().find_map(|mv| SimMoveRequest::from_intent(member_id, mv)) {
+            if let Some(mut req) = decide_movement(&view_i).iter().find_map(|mv| SimMoveRequest::from_intent(member_id, mv)) {
                 let f = &sim.friends()[fi];
                 let combat = f.has_working(Part::RangedAttack) || f.working_parts(Part::Attack) > 0;
-                move_reqs.push(if combat { req.with_priority(MovementPriority::High) } else { req });
+                if combat {
+                    req = req.with_priority(MovementPriority::High);
+                }
+                req = req.with_shove(self.shove_enabled);
+                // Anti-scatter anchor: while Engaged + cohesive, confine each member's shoves/swaps to
+                // within the cohesion radius of the centroid so the resolver can't push the block off its
+                // scored tiles (the investigated managed-squad anchoring gap).
+                if matches!(decision.state, SquadOrderState::Engaged) && decision.cohesion_radius > 0 {
+                    if let Some(center) = decision.center {
+                        req = req.with_anchor(center, decision.cohesion_radius);
+                    }
+                }
+                move_reqs.push(req);
             }
         }
         // ONE traffic-managed pass for the whole squad (rover MovementSystem + resolver), like live.

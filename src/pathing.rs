@@ -12,7 +12,7 @@ use screeps_combat_decision::CombatIntent;
 use screeps_combat_engine::{CombatWorld, CreepId, PlayerId};
 use screeps_rover::traits::CreepHandle;
 use screeps_rover::{
-    ConstructionSiteCostMatrixCache, CostMatrixCache, CostMatrixDataSource, CostMatrixOptions, CostMatrixSystem,
+    AnchorConstraint, ConstructionSiteCostMatrixCache, CostMatrixCache, CostMatrixDataSource, CostMatrixOptions, CostMatrixSystem,
     CostMatrixWrite, CreepCostMatrixCache, CreepMovementData, FleeTarget, LinearCostMatrix, LocalPathfinder,
     MovementData, MovementError, MovementPriority, MovementSystem, MovementSystemExternal, PathfindingProvider,
     StuctureCostMatrixCache,
@@ -178,24 +178,39 @@ pub struct SimMoveRequest {
     pub creep: CreepId,
     pub goal: SimMoveGoal,
     pub priority: MovementPriority,
+    /// Allow the resolver to SHOVE/swap others to reach the tile (the rover default). Toggle off to A/B
+    /// shoving's effect on positioning (the investigated control).
+    pub shove: bool,
+    /// Optional anchor `(center, range)`: confine the resolver's shoves/swaps for this creep to within
+    /// `range` of `center` so a cohesive squad can't be scattered off its scored tiles (the rover
+    /// `AnchorConstraint`). `None` = unconstrained (the prior behavior).
+    pub anchor: Option<(Position, u32)>,
 }
 
 impl SimMoveRequest {
-    /// A `move_to` request (default priority): reach `target` within `range`.
+    /// A `move_to` request (default priority, shove on): reach `target` within `range`.
     pub fn move_to(creep: CreepId, target: Position, range: u32) -> Self {
-        SimMoveRequest { creep, goal: SimMoveGoal::To { target, range }, priority: MovementPriority::Normal }
+        SimMoveRequest { creep, goal: SimMoveGoal::To { target, range }, priority: MovementPriority::Normal, shove: true, anchor: None }
     }
 
     /// Build a request from a movement [`CombatIntent`] (`MoveTo` / `Flee`); `None` for non-movement
     /// intents (`Attack`/`Heal`/`Idle`/…) — so a caller can drive the mover straight from the decision.
     pub fn from_intent(creep: CreepId, intent: &CombatIntent) -> Option<Self> {
         match intent {
-            CombatIntent::MoveTo { target, range } => {
-                Some(SimMoveRequest { creep, goal: SimMoveGoal::To { target: *target, range: *range as u32 }, priority: MovementPriority::Normal })
-            }
-            CombatIntent::Flee { from, range } => {
-                Some(SimMoveRequest { creep, goal: SimMoveGoal::Flee { threats: from.clone(), range: *range as u32 }, priority: MovementPriority::Normal })
-            }
+            CombatIntent::MoveTo { target, range } => Some(SimMoveRequest {
+                creep,
+                goal: SimMoveGoal::To { target: *target, range: *range as u32 },
+                priority: MovementPriority::Normal,
+                shove: true,
+                anchor: None,
+            }),
+            CombatIntent::Flee { from, range } => Some(SimMoveRequest {
+                creep,
+                goal: SimMoveGoal::Flee { threats: from.clone(), range: *range as u32 },
+                priority: MovementPriority::Normal,
+                shove: true,
+                anchor: None,
+            }),
             _ => None,
         }
     }
@@ -203,6 +218,18 @@ impl SimMoveRequest {
     /// Set the contention priority (e.g. `High` for a combat creep that must win the shooting tile).
     pub fn with_priority(mut self, priority: MovementPriority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Enable/disable shoving for this request (the investigated control).
+    pub fn with_shove(mut self, shove: bool) -> Self {
+        self.shove = shove;
+        self
+    }
+
+    /// Confine this creep's shoves/swaps to within `range` of `center` (anti-scatter anchor).
+    pub fn with_anchor(mut self, center: Position, range: u32) -> Self {
+        self.anchor = Some((center, range));
         self
     }
 }
@@ -378,11 +405,19 @@ pub fn resolve_moves_via_system(
     for req in requests {
         match &req.goal {
             SimMoveGoal::To { target, range } => {
-                data.move_to(req.creep, *target).range(*range).allow_shove(true).allow_swap(true).priority(req.priority);
+                let mut mr = data.move_to(req.creep, *target);
+                mr.range(*range).allow_shove(req.shove).allow_swap(req.shove).priority(req.priority);
+                if let Some((position, range)) = req.anchor {
+                    mr.anchor(AnchorConstraint { position, range });
+                }
             }
             SimMoveGoal::Flee { threats, range } => {
                 let targets: Vec<FleeTarget> = threats.iter().map(|p| FleeTarget { pos: *p, range: *range }).collect();
-                data.flee(req.creep, targets).allow_shove(true).allow_swap(true).priority(req.priority);
+                let mut mr = data.flee(req.creep, targets);
+                mr.allow_shove(req.shove).allow_swap(req.shove).priority(req.priority);
+                if let Some((position, range)) = req.anchor {
+                    mr.anchor(AnchorConstraint { position, range });
+                }
             }
         }
     }
