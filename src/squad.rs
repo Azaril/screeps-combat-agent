@@ -7,7 +7,7 @@
 //! routes the squad's W×H box around walls; a [`AnchorOutcome::Blocked`] anchor surfaces a path
 //! failure for the owner to respond to.
 
-use crate::pathing::{build_combat_matrix, resolve_move_direction, resolve_moves_via_system, SimMoveCache, SimMoveRequest};
+use crate::pathing::{build_combat_matrix, resolve_moves_via_system, SimMoveCache, SimMoveRequest};
 use crate::{to_engine_action, SimView};
 use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_decision::{
@@ -16,7 +16,7 @@ use screeps_combat_decision::{
     CreepOrders, FocusTarget, SquadMemberView, SquadOrderState, SquadStateDto, SquadView,
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
-use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder};
+use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority};
 
 /// Members within this Chebyshev distance of their slot count as "in formation".
 const COHESION_TOL: u32 = 1;
@@ -192,7 +192,7 @@ impl SimSquad {
                 let offset = self.layout.get(slot).copied().unwrap_or((0, 0));
                 (offset_pos(anchor, offset), if loose || crossing { 1 } else { 0 })
             };
-            move_reqs.push(SimMoveRequest { creep: member_id, target, range });
+            move_reqs.push(SimMoveRequest::move_to(member_id, target, range));
         }
         // ONE traffic-managed pass: route every member through rover's `MovementSystem` + resolver
         // (swaps / shoves / stuck-escalation), the same mover the live bot uses, then apply the
@@ -221,11 +221,22 @@ pub struct ManagedSimSquad {
     /// Position-scoring weights (ADR 0019 Stage 4 tuning seam). Defaults to the shipped presets; the
     /// EXP sweep sets custom vectors via [`Self::with_tactics`] to tune them empirically.
     tactics: SquadTacticParams,
+    /// Per-creep movement state for the rover `MovementSystem`, persisted across ticks (path reuse +
+    /// stuck-escalation), matching live.
+    move_cache: SimMoveCache,
 }
 
 impl ManagedSimSquad {
     pub fn new(owner: PlayerId, members: Vec<CreepId>, objective: Position) -> Self {
-        Self { owner, members, objective, retreat_threshold: 0.3, state: SquadOrderState::Forming, tactics: SquadTacticParams::default() }
+        Self {
+            owner,
+            members,
+            objective,
+            retreat_threshold: 0.3,
+            state: SquadOrderState::Forming,
+            tactics: SquadTacticParams::default(),
+            move_cache: SimMoveCache::default(),
+        }
     }
 
     /// Override the position-scoring weights (the EXP-* sweep loop, ADR 0019 Stage 4).
@@ -284,6 +295,7 @@ impl ManagedSimSquad {
         };
 
         let mut intents = Intents::new();
+        let mut move_reqs: Vec<SimMoveRequest> = Vec::new();
         for (idx, &(member_id, fi)) in living.iter().enumerate() {
             let heal_target = decision.heal_assignments.iter().find(|a| a.healer_idx == idx).and_then(|a| {
                 let &(_, tfi) = living.get(a.target_idx)?;
@@ -300,13 +312,20 @@ impl ManagedSimSquad {
             if !actions.is_empty() {
                 intents.set(member_id, actions);
             }
-            let me_pos = sim.friends()[fi].pos;
-            for mv in decide_movement(&view_i) {
-                if let Some(dir) = resolve_move_direction(world, me_pos, self.owner, &mv) {
-                    intents.set_move(member_id, dir);
-                    break;
-                }
+            // The squad's movement is the highest-priority movement intent (`decide_movement` returns
+            // a priority list; the executor used to take the first with a path). Route it through the
+            // shared resolver mover with everyone else's so the manager squad gets traffic management.
+            // Combat creeps take HIGH priority so they win the forward (shooting) tile over support —
+            // otherwise the resolver's neutral tie-break can park the shooter one tile out of range.
+            if let Some(req) = decide_movement(&view_i).iter().find_map(|mv| SimMoveRequest::from_intent(member_id, mv)) {
+                let f = &sim.friends()[fi];
+                let combat = f.has_working(Part::RangedAttack) || f.working_parts(Part::Attack) > 0;
+                move_reqs.push(if combat { req.with_priority(MovementPriority::High) } else { req });
             }
+        }
+        // ONE traffic-managed pass for the whole squad (rover MovementSystem + resolver), like live.
+        for (id, dir) in resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache) {
+            intents.set_move(id, dir);
         }
         intents
     }

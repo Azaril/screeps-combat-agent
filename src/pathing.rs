@@ -13,8 +13,9 @@ use screeps_combat_engine::{CombatWorld, CreepId, PlayerId};
 use screeps_rover::traits::CreepHandle;
 use screeps_rover::{
     ConstructionSiteCostMatrixCache, CostMatrixCache, CostMatrixDataSource, CostMatrixOptions, CostMatrixSystem,
-    CostMatrixWrite, CreepCostMatrixCache, CreepMovementData, LinearCostMatrix, LocalPathfinder, MovementData,
-    MovementError, MovementSystem, MovementSystemExternal, PathfindingProvider, StuctureCostMatrixCache,
+    CostMatrixWrite, CreepCostMatrixCache, CreepMovementData, FleeTarget, LinearCostMatrix, LocalPathfinder,
+    MovementData, MovementError, MovementPriority, MovementSystem, MovementSystemExternal, PathfindingProvider,
+    StuctureCostMatrixCache,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -162,11 +163,48 @@ const DEFAULT_SHOVE_DEPTH: u32 = 3;
 /// Per-creep movement state (cached path + stuck tracking), persisted across ticks by the caller.
 pub type SimMoveCache = HashMap<CreepId, CreepMovementData>;
 
-/// A `move_to` request for [`resolve_moves_via_system`]: reach `target` within `range`.
+/// A movement goal for [`resolve_moves_via_system`] — mirrors the movement [`CombatIntent`]s.
+pub enum SimMoveGoal {
+    /// Reach `target` within `range`.
+    To { target: Position, range: u32 },
+    /// Flee to outside `range` of every threat.
+    Flee { threats: Vec<Position>, range: u32 },
+}
+
+/// A per-creep movement request for [`resolve_moves_via_system`]. `priority` decides who wins a
+/// contested tile (the resolver orders by priority before any tie-break) — e.g. a squad's combat
+/// creep takes `High` so it claims the forward kite/shooting spot over a support creep.
 pub struct SimMoveRequest {
     pub creep: CreepId,
-    pub target: Position,
-    pub range: u32,
+    pub goal: SimMoveGoal,
+    pub priority: MovementPriority,
+}
+
+impl SimMoveRequest {
+    /// A `move_to` request (default priority): reach `target` within `range`.
+    pub fn move_to(creep: CreepId, target: Position, range: u32) -> Self {
+        SimMoveRequest { creep, goal: SimMoveGoal::To { target, range }, priority: MovementPriority::Normal }
+    }
+
+    /// Build a request from a movement [`CombatIntent`] (`MoveTo` / `Flee`); `None` for non-movement
+    /// intents (`Attack`/`Heal`/`Idle`/…) — so a caller can drive the mover straight from the decision.
+    pub fn from_intent(creep: CreepId, intent: &CombatIntent) -> Option<Self> {
+        match intent {
+            CombatIntent::MoveTo { target, range } => {
+                Some(SimMoveRequest { creep, goal: SimMoveGoal::To { target: *target, range: *range as u32 }, priority: MovementPriority::Normal })
+            }
+            CombatIntent::Flee { from, range } => {
+                Some(SimMoveRequest { creep, goal: SimMoveGoal::Flee { threats: from.clone(), range: *range as u32 }, priority: MovementPriority::Normal })
+            }
+            _ => None,
+        }
+    }
+
+    /// Set the contention priority (e.g. `High` for a combat creep that must win the shooting tile).
+    pub fn with_priority(mut self, priority: MovementPriority) -> Self {
+        self.priority = priority;
+        self
+    }
 }
 
 /// Shared sink the creep handles write their resolved direction into (`move_direction` is `&self`,
@@ -338,7 +376,15 @@ pub fn resolve_moves_via_system(
     // now multi-room, so no MoveToRoom pre-projection is needed.
     let mut data = MovementData::new();
     for req in requests {
-        data.move_to(req.creep, req.target).range(req.range).allow_shove(true).allow_swap(true);
+        match &req.goal {
+            SimMoveGoal::To { target, range } => {
+                data.move_to(req.creep, *target).range(*range).allow_shove(true).allow_swap(true).priority(req.priority);
+            }
+            SimMoveGoal::Flee { threats, range } => {
+                let targets: Vec<FleeTarget> = threats.iter().map(|p| FleeTarget { pos: *p, range: *range }).collect();
+                data.flee(req.creep, targets).allow_shove(true).allow_swap(true).priority(req.priority);
+            }
+        }
     }
     let _ = system.process(&mut external, data);
 
@@ -489,7 +535,7 @@ mod tests {
                 reached = true;
                 break;
             }
-            let reqs = [SimMoveRequest { creep: 1, target, range: 0 }];
+            let reqs = [SimMoveRequest::move_to(1, target, 0)];
             let moves = resolve_moves_via_system(&world, 0, &reqs, &mut cache);
             let mut i = Intents::new();
             if let Some(&dir) = moves.get(&1) {
@@ -520,10 +566,7 @@ mod tests {
                 both_arrived = true;
                 break;
             }
-            let reqs = [
-                SimMoveRequest { creep: 1, target: ta, range: 0 },
-                SimMoveRequest { creep: 2, target: tb, range: 0 },
-            ];
+            let reqs = [SimMoveRequest::move_to(1, ta, 0), SimMoveRequest::move_to(2, tb, 0)];
             let moves = resolve_moves_via_system(&world, 0, &reqs, &mut cache);
             let mut i = Intents::new();
             for (&id, &dir) in &moves {
