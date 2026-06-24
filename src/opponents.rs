@@ -214,8 +214,9 @@ pub struct EngagementOutcome {
     /// Total remaining energy across each side's living towers (0 if none) — for drain validation.
     pub side_a_tower_energy: u32,
     pub side_b_tower_energy: u32,
-    /// Per-tick replay capture — render with [`crate::replay::to_svg`] (or `recording.render()`). The
-    /// richer per-side metrics + stalemate adjudication are computed from this in `screeps-combat-eval`.
+    /// Per-tick replay capture — `recording.render()` for a text dump, or the interactive HTML replay
+    /// player in `screeps-combat-eval` (`harness::visualize`). The richer per-side metrics + stalemate
+    /// adjudication are also computed from this in `screeps-combat-eval`.
     pub recording: CombatRecording,
 }
 

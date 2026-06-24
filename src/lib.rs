@@ -18,7 +18,6 @@
 pub mod objective_bed;
 pub mod opponents;
 pub mod pathing;
-pub mod replay;
 pub mod scenario;
 pub mod scenarios;
 pub mod squad;
