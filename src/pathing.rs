@@ -7,14 +7,18 @@
 //! (ADR 0006 §B.2). Real pathfinding, not a greedy stepper: a kiter routes *around* obstacles.
 
 use screeps::local::LocalCostMatrix;
-use screeps::{Direction, Position, RoomCoordinate, RoomName};
+use screeps::{Direction, Position, RoomName};
 use screeps_combat_decision::CombatIntent;
-use screeps_combat_engine::{CombatWorld, PlayerId};
+use screeps_combat_engine::{CombatWorld, CreepId, PlayerId};
+use screeps_rover::traits::CreepHandle;
 use screeps_rover::{
     ConstructionSiteCostMatrixCache, CostMatrixCache, CostMatrixDataSource, CostMatrixOptions, CostMatrixSystem,
-    CostMatrixWrite, CreepCostMatrixCache, LinearCostMatrix, LocalPathfinder, PathfindingProvider,
-    StuctureCostMatrixCache,
+    CostMatrixWrite, CreepCostMatrixCache, CreepMovementData, LinearCostMatrix, LocalPathfinder, MovementData,
+    MovementError, MovementSystem, MovementSystemExternal, PathfindingProvider, StuctureCostMatrixCache,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Search budget — the room is 2500 tiles; this comfortably covers a single-room plan.
 const MAX_OPS: u32 = 2000;
@@ -112,34 +116,11 @@ pub fn build_combat_matrix(world: &CombatWorld, room: RoomName, me_owner: Player
     system.build_local_cost_matrix(room, &CostMatrixOptions::default()).ok()
 }
 
-/// Project a (possibly cross-room) `target` onto `from`'s current room (ADR 0023 S3 "MoveToRoom"):
-/// for a same-room target, the target itself; for a cross-room target, the target's world position
-/// **clamped to the current room** — i.e. the room-edge tile that points toward the target's room.
-/// The headless [`LocalPathfinder`] is single-room (cross-room travel is a separate MoveToRoom phase,
-/// like the live bot's `find_route` + move-to-exit), so the creep routes to that exit tile and the
-/// engine's edge-exit relocation (`resolve_tick` Phase D) carries it across; the next room re-projects.
-fn in_room_goal(from: Position, target: Position) -> Position {
-    if from.room_name() == target.room_name() {
-        return target;
-    }
-    let (fwx, fwy) = from.world_coords();
-    let (twx, twy) = target.world_coords();
-    let origin_x = fwx - from.x().u8() as i32; // the current room's world-coord origin
-    let origin_y = fwy - from.y().u8() as i32;
-    let lx = (twx - origin_x).clamp(0, 49) as u8;
-    let ly = (twy - origin_y).clamp(0, 49) as u8;
-    Position::new(
-        RoomCoordinate::new(lx).expect("clamped 0..=49"),
-        RoomCoordinate::new(ly).expect("clamped 0..=49"),
-        from.room_name(),
-    )
-}
-
 /// Resolve a movement goal to the next-step [`Direction`] from `from` (owned by `me_owner`), via
 /// rover's pathfinder over the `CombatWorld`. Returns `None` for non-movement intents, when already
 /// satisfied (empty path), or when no route exists. Combat intents (`Attack`/`Heal`/…) and `Idle`
-/// yield `None` here. **Cross-room `MoveTo`** routes to the room-edge tile toward the target (see
-/// [`in_room_goal`]); the engine's edge-exit carries the creep across, then the next room re-projects.
+/// yield `None` here. **`MoveTo` routes directly to a (possibly cross-room) target** — rover's search
+/// is multi-room, so no MoveToRoom projection is needed; the engine's edge-exit carries the cross.
 pub fn resolve_move_direction(
     world: &CombatWorld,
     from: Position,
@@ -152,11 +133,8 @@ pub fn resolve_move_direction(
 
     let result = match intent {
         CombatIntent::MoveTo { target, range } => {
-            // Single-room search to the in-room goal: the target if same-room, else the edge tile
-            // toward the target's room (range 0 — reach the exit exactly so the edge-exit fires).
-            let goal = in_room_goal(from, *target);
-            let goal_range = if goal == *target { *range as u32 } else { 0 };
-            pf.search(from, goal, goal_range, &mut room_cb, MAX_OPS, opts.plains_cost, opts.swamp_cost)
+            // The multi-room search routes directly to a (possibly cross-room) target.
+            pf.search(from, *target, *range as u32, &mut room_cb, MAX_OPS, opts.plains_cost, opts.swamp_cost)
         }
         CombatIntent::Flee { from: threats, range } => {
             let goals: Vec<(Position, u32)> = threats.iter().map(|p| (*p, *range as u32)).collect();
@@ -166,6 +144,199 @@ pub fn resolve_move_direction(
     };
 
     result.path.first().and_then(|next| from.get_direction_to(*next))
+}
+
+// ── Unified mover: route through rover's MovementSystem + resolver (P-MOVE+ / task #30) ──────────
+//
+// The live bot moves creeps through rover's `MovementSystem` (cached paths, multi-room `find_route`,
+// and the `resolver`'s traffic management — swaps / shoves / local-avoidance / stuck-escalation),
+// then the game server applies the moves. The sim mirrors this: `resolve_moves_via_system` runs the
+// SAME `MovementSystem` over a `CombatWorld` and hands the resolved directions to `resolve_tick` (the
+// authoritative "server"). This is the unified replacement for the per-creep `resolve_move_direction`
+// shim, so sim ≡ live. The per-creep `CreepMovementData` cache is the CALLER's (held across ticks) so
+// path reuse + the stuck-escalation (avoid-friendlies → shove) actually accumulate.
+
+/// Default shove-chain depth for the sim mover.
+const DEFAULT_SHOVE_DEPTH: u32 = 3;
+
+/// Per-creep movement state (cached path + stuck tracking), persisted across ticks by the caller.
+pub type SimMoveCache = HashMap<CreepId, CreepMovementData>;
+
+/// A `move_to` request for [`resolve_moves_via_system`]: reach `target` within `range`.
+pub struct SimMoveRequest {
+    pub creep: CreepId,
+    pub target: Position,
+    pub range: u32,
+}
+
+/// Shared sink the creep handles write their resolved direction into (`move_direction` is `&self`,
+/// mirroring the live `creep.move()`, so it needs interior mutability).
+type MoveSink = Rc<RefCell<HashMap<CreepId, Direction>>>;
+
+/// A [`CreepHandle`] over a `SimCreep` snapshot; `move_direction` records into the shared sink (the
+/// sim's analogue of issuing `creep.move(dir)` to the server).
+struct CombatCreepHandle {
+    id: CreepId,
+    pos: Position,
+    fatigue: u32,
+    sink: MoveSink,
+}
+
+impl CreepHandle for CombatCreepHandle {
+    fn pos(&self) -> Position {
+        self.pos
+    }
+    fn fatigue(&self) -> u32 {
+        self.fatigue
+    }
+    fn spawning(&self) -> bool {
+        false
+    }
+    fn move_direction(&self, dir: Direction) -> Result<(), String> {
+        self.sink.borrow_mut().insert(self.id, dir);
+        Ok(())
+    }
+    fn pull(&self, _other: &Self) -> Result<(), String> {
+        Ok(()) // pull chains: a sim follow-up (the engine supports Intents.pulls); no-op for now.
+    }
+    fn move_pulled_by(&self, _other: &Self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// `CombatWorld`-backed [`MovementSystemExternal`] — the headless analogue of the live
+/// `MovementSystemExternalProvider`. Owns the move sink + borrows the world + the caller's cache.
+struct CombatMovementExternal<'w, 'c> {
+    world: &'w CombatWorld,
+    sink: MoveSink,
+    cache: &'c mut SimMoveCache,
+}
+
+impl MovementSystemExternal<CreepId> for CombatMovementExternal<'_, '_> {
+    type Creep = CombatCreepHandle;
+
+    fn get_creep(&self, entity: CreepId) -> Result<CombatCreepHandle, MovementError> {
+        let c = self
+            .world
+            .creeps
+            .iter()
+            .find(|c| c.id == entity && c.is_alive())
+            .ok_or_else(|| "creep not found".to_owned())?;
+        Ok(CombatCreepHandle { id: entity, pos: c.pos, fatigue: c.fatigue, sink: self.sink.clone() })
+    }
+
+    fn get_creep_movement_data(&mut self, entity: CreepId) -> Result<&mut CreepMovementData, MovementError> {
+        Ok(self.cache.entry(entity).or_default())
+    }
+
+    fn get_entity_position(&self, entity: CreepId) -> Option<Position> {
+        self.world.creeps.iter().find(|c| c.id == entity && c.is_alive()).map(|c| c.pos)
+    }
+}
+
+#[derive(Default)]
+struct RoomObstacles {
+    walls: Vec<(u8, u8)>,
+    swamps: Vec<(u8, u8)>,
+    blockers: Vec<(u8, u8)>,
+    hostiles: Vec<(u8, u8)>,
+}
+
+/// Multi-room [`CostMatrixDataSource`] over a whole `CombatWorld` snapshot (vs the single-room
+/// `CombatCostSource` the per-creep path uses) — so the `MovementSystem` can build a cost matrix for
+/// ANY room it routes through. Owns its data (`'static`): per room, walls + swamps (terrain),
+/// structures/towers + hostile creeps (impassable); friendlies are not avoided. Rooms with no content
+/// are all-plain (passable).
+struct CombatWorldCostSource {
+    rooms: HashMap<RoomName, RoomObstacles>,
+}
+
+impl CombatWorldCostSource {
+    fn from_world(world: &CombatWorld, me_owner: PlayerId) -> Self {
+        let mut rooms: HashMap<RoomName, RoomObstacles> = HashMap::new();
+        for s in world.structures.iter().filter(|s| s.is_alive()) {
+            rooms.entry(s.pos.room_name()).or_default().blockers.push((s.pos.x().u8(), s.pos.y().u8()));
+        }
+        for t in world.towers.iter().filter(|t| t.is_alive()) {
+            rooms.entry(t.pos.room_name()).or_default().blockers.push((t.pos.x().u8(), t.pos.y().u8()));
+        }
+        for c in world.creeps.iter().filter(|c| c.is_alive() && c.owner != me_owner) {
+            rooms.entry(c.pos.room_name()).or_default().hostiles.push((c.pos.x().u8(), c.pos.y().u8()));
+        }
+        // Terrain for every room with content, plus any explicit per-room override.
+        let names: Vec<RoomName> = rooms.keys().copied().chain(world.rooms.keys().copied()).collect();
+        for name in names {
+            let terrain = world.terrain_for(name);
+            let entry = rooms.entry(name).or_default();
+            entry.walls.extend(terrain.walls.iter().copied());
+            entry.swamps.extend(terrain.swamps.iter().copied());
+        }
+        Self { rooms }
+    }
+}
+
+impl CostMatrixDataSource for CombatWorldCostSource {
+    fn get_structure_costs(&self, room_name: RoomName) -> Option<StuctureCostMatrixCache> {
+        let mut other = LinearCostMatrix::new();
+        if let Some(o) = self.rooms.get(&room_name) {
+            for &(x, y) in &o.swamps {
+                other.set(x, y, SWAMP_COST);
+            }
+            for &(x, y) in o.walls.iter().chain(&o.blockers) {
+                other.set(x, y, u8::MAX);
+            }
+        }
+        Some(StuctureCostMatrixCache { roads: LinearCostMatrix::new(), other })
+    }
+
+    fn get_construction_site_costs(&self, _room: RoomName) -> Option<ConstructionSiteCostMatrixCache> {
+        None
+    }
+
+    fn get_creep_costs(&self, room_name: RoomName) -> Option<CreepCostMatrixCache> {
+        let mut hostile_creeps = LinearCostMatrix::new();
+        if let Some(o) = self.rooms.get(&room_name) {
+            for &(x, y) in &o.hostiles {
+                hostile_creeps.set(x, y, u8::MAX);
+            }
+        }
+        Some(CreepCostMatrixCache {
+            friendly_creeps: LinearCostMatrix::new(),
+            hostile_creeps,
+            source_keeper_agro: LinearCostMatrix::new(),
+        })
+    }
+}
+
+/// Run rover's `MovementSystem` (resolver included) over `world` for `owner`'s `requests`, returning
+/// the resolved per-creep directions to hand to `resolve_tick`. `cache` is the caller's persisted
+/// per-creep movement state (path reuse + stuck-escalation accumulate across ticks). This is the
+/// traffic-managed, unified analogue of calling [`resolve_move_direction`] per creep.
+pub fn resolve_moves_via_system(
+    world: &CombatWorld,
+    owner: PlayerId,
+    requests: &[SimMoveRequest],
+    cache: &mut SimMoveCache,
+) -> HashMap<CreepId, Direction> {
+    let sink: MoveSink = Rc::new(RefCell::new(HashMap::new()));
+    let mut external = CombatMovementExternal { world, sink: sink.clone(), cache };
+
+    let mut cm_cache = CostMatrixCache::default();
+    let mut cms = CostMatrixSystem::new(&mut cm_cache, Box::new(CombatWorldCostSource::from_world(world, owner)));
+    let mut pf = LocalPathfinder;
+    let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+    system.set_max_shove_depth(DEFAULT_SHOVE_DEPTH);
+
+    // The MovementSystem routes to the (possibly cross-room) target directly — the rover search is
+    // now multi-room, so no MoveToRoom pre-projection is needed.
+    let mut data = MovementData::new();
+    for req in requests {
+        data.move_to(req.creep, req.target).range(req.range).allow_shove(true).allow_swap(true);
+    }
+    let _ = system.process(&mut external, data);
+
+    drop(external);
+    Rc::try_unwrap(sink).map(|c| c.into_inner()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -294,5 +465,65 @@ mod tests {
             resolve_tick(&mut world, &i);
         }
         assert!(reached, "the creep pathed across the border into the east room and reached the target");
+    }
+
+    #[test]
+    fn system_mover_routes_a_creep_across_a_room_boundary() {
+        // The UNIFIED mover (rover MovementSystem + resolver) routes a creep across a border to a
+        // target — the sim now runs the SAME traffic-managed mover as live, not just the per-creep
+        // shim. The CreepMovementData cache persists across ticks (path reuse + stuck-escalation).
+        let target = pos_in(east_room(), 5, 25);
+        let mut world = CombatWorld { creeps: vec![creep(1, 45, 25)], ..Default::default() };
+        let mut cache = SimMoveCache::new();
+        let mut reached = false;
+        for _ in 0..60 {
+            let from = world.creeps[0].pos;
+            if from == target {
+                reached = true;
+                break;
+            }
+            let reqs = [SimMoveRequest { creep: 1, target, range: 0 }];
+            let moves = resolve_moves_via_system(&world, 0, &reqs, &mut cache);
+            let mut i = Intents::new();
+            if let Some(&dir) = moves.get(&1) {
+                i.set_move(1, dir);
+            }
+            resolve_tick(&mut world, &i);
+        }
+        assert!(reached, "the MovementSystem-routed creep crossed the border and reached the target");
+    }
+
+    #[test]
+    fn system_mover_deconflicts_two_creeps() {
+        // Two creeps moving head-on toward each other's tile in the same row. The unified mover runs
+        // BOTH through one resolver pass (the traffic manager), so they pass each other and both reach
+        // their targets — no deadlock. (Exercises the multi-creep resolver path the per-creep shim
+        // could not coordinate.)
+        let mut world = CombatWorld {
+            creeps: vec![creep(1, 10, 25), creep(2, 16, 25)],
+            ..Default::default()
+        };
+        let (ta, tb) = (pos(16, 25), pos(10, 25));
+        let mut cache = SimMoveCache::new();
+        let mut both_arrived = false;
+        for _ in 0..30 {
+            let a = world.creeps.iter().find(|c| c.id == 1).map(|c| c.pos);
+            let b = world.creeps.iter().find(|c| c.id == 2).map(|c| c.pos);
+            if a == Some(ta) && b == Some(tb) {
+                both_arrived = true;
+                break;
+            }
+            let reqs = [
+                SimMoveRequest { creep: 1, target: ta, range: 0 },
+                SimMoveRequest { creep: 2, target: tb, range: 0 },
+            ];
+            let moves = resolve_moves_via_system(&world, 0, &reqs, &mut cache);
+            let mut i = Intents::new();
+            for (&id, &dir) in &moves {
+                i.set_move(id, dir);
+            }
+            resolve_tick(&mut world, &i);
+        }
+        assert!(both_arrived, "the resolver let both creeps pass each other and reach their targets");
     }
 }
