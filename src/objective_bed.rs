@@ -295,4 +295,102 @@ mod tests {
         assert_eq!(heals, 1, "one tower heals the damaged defender");
         assert_eq!(attacks, 1, "the other tower attacks the closest hostile");
     }
+
+    /// P-FORCE offline validation (ADR 0022): the heal dimension of force-sizing against the engine's
+    /// ground-truth resolve. A squad sized with ENOUGH healers to out-heal the focused tower fire — the
+    /// member-count-scaling outcome of `sized_for` (D3): one creep can't carry the heal, so the squad
+    /// GROWS healers — HOLDS under sustained tower fire + active rampart repair and breaches the core;
+    /// the SAME dismantler with only ONE healer (under the heal threshold) is worn down before it can
+    /// break through. Bodies are hand-built here (the bot's `sized_for` lives in a sibling crate the sim
+    /// can't depend on); the per-tick numbers mirror what the closed-form oracle (HOLD_MARGIN heal vs
+    /// tower DPS) produces. Static positions keep it deterministic; the rampart-breach-through-repair
+    /// mechanic is also covered by `sufficient_dps_breaches_the_core` / `attacker_marches_*`.
+    #[test]
+    fn force_sized_squad_holds_and_breaches_where_underhealed_is_wiped() {
+        // The attacker AI: WORK creeps dismantle the nearest living rampart, then the core; HEAL creeps
+        // heal the most-damaged ally (adjacent → Heal, ≤3 → RangedHeal). Mirrors the squad's
+        // dismantler/healer roles. All units start in range, so no movement is needed (determinism).
+        fn sized_squad_intents(world: &CombatWorld, attacker: PlayerId, core_id: StructureId, core_pos: Position) -> Intents {
+            let mut intents = Intents::new();
+            let wounded = world
+                .creeps
+                .iter()
+                .filter(|c| c.is_alive() && c.owner == attacker)
+                .min_by_key(|c| c.body.hits)
+                .map(|c| (c.id, c.pos));
+            for c in world.creeps.iter().filter(|c| c.is_alive() && c.owner == attacker) {
+                if c.body.dismantle_power() > 0 {
+                    let rampart = world
+                        .structures
+                        .iter()
+                        .filter(|s| s.is_alive() && s.kind == StructureKind::Rampart)
+                        .min_by_key(|s| c.pos.get_range_to(s.pos));
+                    let (tpos, tid) = match rampart {
+                        Some(r) => (r.pos, r.id),
+                        None => (core_pos, core_id),
+                    };
+                    if c.pos.get_range_to(tpos) <= 1 {
+                        intents.set(c.id, vec![CombatAction::Dismantle(tid)]);
+                    }
+                } else if c.body.heal_power() > 0 {
+                    if let Some((wid, wpos)) = wounded {
+                        let r = c.pos.get_range_to(wpos);
+                        if r <= 1 {
+                            intents.set(c.id, vec![CombatAction::Heal(wid)]);
+                        } else if r <= 3 {
+                            intents.set(c.id, vec![CombatAction::RangedHeal(wid)]);
+                        }
+                    }
+                }
+            }
+            intents
+        }
+
+        // Bed: a thick rampart (24,25) walls the core (25,25). Three towers at range 16 from the (24,24)
+        // assault tile (≈270 attack / ≈360 repair each). Once the rampart is damaged one tower maintains
+        // (repairs it), the other two focus the closest attacker (≈540 dps) — survivable by a multi-healer
+        // squad, lethal to a single healer before the (30k) rampart falls.
+        let build_bed = || {
+            let mut b = ScenarioBuilder::empty(room());
+            let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), 25, 25, 3000, 3000);
+            for tx in [23u8, 24, 25] {
+                b.tower(DEFENDER, tx, 8, 100_000); // range 16 from (24,24)
+            }
+            let world = b.rampart(DEFENDER, 24, 25, 30_000).build();
+            (world, core_id)
+        };
+        // The dismantler sits at (24,24): range 1 to BOTH the rampart (24,25) and the core (25,25), so it
+        // breaches and then kills the core without moving. TOUGH front (unboosted = HP buffer), 25 WORK.
+        let dismantler: Vec<Part> = std::iter::repeat_n(Part::Tough, 8)
+            .chain(std::iter::repeat_n(Part::Work, 25))
+            .chain(std::iter::repeat_n(Part::Move, 17))
+            .collect();
+        let healer: Vec<Part> = std::iter::repeat_n(Part::Heal, 23).chain(std::iter::repeat_n(Part::Move, 10)).collect();
+        let core_pos = pos(25, 25);
+
+        // ── SIZED: dismantler + THREE healers (≈828 heal/tick ≥ the worst-case ≈810 all-tower burst) ──
+        let (mut world, core_id) = build_bed();
+        world.creeps.push(SimCreep { id: 1, owner: ATTACKER, pos: pos(24, 24), body: SimBody::unboosted(&dismantler), fatigue: 0 });
+        for (i, (hx, hy)) in [(23u8, 24u8), (23, 23), (24, 23)].into_iter().enumerate() {
+            world.creeps.push(SimCreep { id: 2 + i as u32, owner: ATTACKER, pos: pos(hx, hy), body: SimBody::unboosted(&healer), fatigue: 0 });
+        }
+        let sized = run_siege(world, DEFENDER, core_id, core_pos, &mut |w| sized_squad_intents(w, ATTACKER, core_id, core_pos), 300);
+        assert_eq!(
+            sized.result,
+            SiegeResult::CoreBreached,
+            "the force-sized (multi-healer) squad holds under tower fire + active repair and breaches; got {sized:?}"
+        );
+
+        // ── UNDER-HEALED: the same dismantler + ONE healer (≈276 heal ≪ the focus dps) → wiped first ──
+        let (mut world, core_id) = build_bed();
+        world.creeps.push(SimCreep { id: 1, owner: ATTACKER, pos: pos(24, 24), body: SimBody::unboosted(&dismantler), fatigue: 0 });
+        world.creeps.push(SimCreep { id: 2, owner: ATTACKER, pos: pos(23, 24), body: SimBody::unboosted(&healer), fatigue: 0 });
+        let under = run_siege(world, DEFENDER, core_id, core_pos, &mut |w| sized_squad_intents(w, ATTACKER, core_id, core_pos), 300);
+        assert_ne!(
+            under.result,
+            SiegeResult::CoreBreached,
+            "an under-healed squad is worn down before it can breach (size-to-hold is load-bearing); got {under:?}"
+        );
+        assert_eq!(under.core_hits, 3000, "the core never took a hit — the under-healed squad never broke through");
+    }
 }
