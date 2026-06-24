@@ -13,7 +13,7 @@ use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_decision::{
     cohesion, decide_combat, decide_movement, decide_squad_with_pathing,
     kite::{SquadTacticParams, MAX_KITE_OPS},
-    CombatIntent, CreepOrders, FocusTarget, SquadMemberView, SquadOrderState, SquadStateDto, SquadView,
+    CombatIntent, CreepOrders, EngageObjective, FocusTarget, SquadMemberView, SquadMovement, SquadOrderState, SquadStateDto, SquadView,
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
 use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority};
@@ -224,7 +224,18 @@ pub struct ManagedSimSquad {
     /// Per-creep movement state for the rover `MovementSystem`, persisted across ticks (path reuse +
     /// stuck-escalation), matching live.
     move_cache: SimMoveCache,
+    /// What the squad intends toward the enemy: `Destroy` (close + finish; default) vs `Hold` (pin at
+    /// standoff). Fed to the engage gate (close-to-kill + stalemate disengage).
+    intent: EngageObjective,
+    /// Stalemate tracking: the previous tick's total ENEMY hits + how many consecutive ticks we've made
+    /// no headway on it. Past [`STALL_LIMIT`] the squad reports `enemy_stalled` (disengage under Destroy).
+    prev_enemy_hits: Option<u32>,
+    stall_ticks: u32,
 }
+
+/// Consecutive no-enemy-HP-progress ticks before a Destroy squad treats the fight as a stalemate and
+/// disengages (don't burn `CREEP_LIFE_TIME` on an un-closable standoff).
+const STALL_LIMIT: u32 = 40;
 
 impl ManagedSimSquad {
     pub fn new(owner: PlayerId, members: Vec<CreepId>, objective: Position) -> Self {
@@ -236,12 +247,22 @@ impl ManagedSimSquad {
             state: SquadOrderState::Forming,
             tactics: SquadTacticParams::default(),
             move_cache: SimMoveCache::default(),
+            intent: EngageObjective::Destroy,
+            prev_enemy_hits: None,
+            stall_ticks: 0,
         }
     }
 
     /// Override the position-scoring weights (the EXP-* sweep loop, ADR 0019 Stage 4).
     pub fn with_tactics(mut self, tactics: SquadTacticParams) -> Self {
         self.tactics = tactics;
+        self
+    }
+
+    /// Set the squad's engage intent — `Destroy` (close + finish, the default) vs `Hold` (pin at
+    /// standoff). Drives the close-to-kill gradient + the stalemate disengage.
+    pub fn with_intent(mut self, intent: EngageObjective) -> Self {
+        self.intent = intent;
         self
     }
 
@@ -295,6 +316,16 @@ impl ManagedSimSquad {
             })
             .collect();
 
+        // Stalemate tracking: total alive ENEMY hits this tick; no decrease for STALL_LIMIT ticks ⇒ a
+        // standoff we're not closing → report enemy_stalled (the Destroy disengage; Hold ignores it).
+        let enemy_hits: u32 = sim.hostiles().iter().filter(|h| h.hits > 0).map(|h| h.hits).sum();
+        match self.prev_enemy_hits {
+            Some(prev) if enemy_hits >= prev => self.stall_ticks = self.stall_ticks.saturating_add(1),
+            _ => self.stall_ticks = 0,
+        }
+        self.prev_enemy_hits = Some(enemy_hits);
+        let enemy_stalled = self.stall_ticks >= STALL_LIMIT;
+
         let view = SquadView {
             members: &member_views,
             hostiles: sim.hostiles(),
@@ -303,6 +334,8 @@ impl ManagedSimSquad {
             current_state: self.state,
             // Enemy safe mode nullifies all our combat in the room (engage-veto, ADR 0020 §8).
             enemy_safe_mode: world.safe_mode_owner.is_some_and(|o| o != self.owner),
+            engage_objective: self.intent,
+            enemy_stalled,
         };
         let decision = decide_squad_with_pathing(&view, None, self.tactics, &mut |r| build_combat_matrix(world, r, self.owner), MAX_KITE_OPS);
         self.state = decision.state;
@@ -326,7 +359,15 @@ impl ManagedSimSquad {
             // aligns with `decision.focus_assignments` (member_views were built from `living` in order).
             let focus = decision.focus_assignments.get(idx).copied().flatten().or(decision.focus);
             let orders = CreepOrders { focus, heal_target };
-            let view_i = sim.view_for_with(fi, &squad_dto, orders);
+            // ADR 0019 §8 heal-coverage positioning: a pure-support healer gets its OWN tile goal
+            // (member_goals) instead of the shared block directive — the live SquadManager applies it the
+            // same way (squad_manager.rs). Without this the sim drops §8 and healers can drift out of heal
+            // range (the operator-flagged cohesion gap). Stamp it as this member's Advance{range:0}.
+            let mut member_dto = squad_dto.clone();
+            if let Some(goal) = decision.member_goals.get(idx).copied().flatten() {
+                member_dto.movement = SquadMovement::Advance { goal, range: 0 };
+            }
+            let view_i = sim.view_for_with(fi, &member_dto, orders);
 
             let actions: Vec<_> = decide_combat(&view_i).iter().filter_map(|ci| to_engine_action(ci, &sim)).collect();
             if !actions.is_empty() {
