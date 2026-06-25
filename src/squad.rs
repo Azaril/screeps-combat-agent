@@ -710,4 +710,39 @@ mod tests {
         let near = squad.member_positions(&sim).iter().filter(|p| p.get_range_to(squad.anchor.virtual_pos) <= LOOSE_RADIUS).count();
         assert!(near >= 4, "blob stayed loosely gathered near the anchor ({} of 5 within {})", near, LOOSE_RADIUS);
     }
+
+    #[test]
+    fn a_winnable_melee_heal_siege_closes_and_dismantles_under_tower_fire() {
+        // Operator-flagged "melee+heal sitting outside of range": a melee+heal squad facing a
+        // tower-defended structure must CLOSE to range 1 and dismantle when the fight is winnable (the
+        // squad out-sustains the tower). (The unwinnable case correctly retreats — that's the gate, not
+        // this.) A 6-strong TOUGH/ATTACK/HEAL squad out-heals one close tower → it should reach + raze.
+        use crate::scenario::ScenarioBuilder;
+        use screeps_combat_engine::StructureKind;
+        let mut b = ScenarioBuilder::empty(room());
+        let spawn_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 50_000, 50_000);
+        b.tower(1, 24, 16, 100_000);
+        let mut world = b.build();
+        let body = [
+            Part::Tough, Part::Tough, Part::Attack, Part::Attack, Part::Attack,
+            Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal,
+            Part::Move, Part::Move, Part::Move, Part::Move, Part::Move, Part::Move,
+        ];
+        for (i, y) in [23u8, 24, 25, 26, 27, 28].into_iter().enumerate() {
+            world.creeps.push(SimCreep { id: 1 + i as u32, owner: 0, pos: pos(20, y), body: SimBody::unboosted(&body), fatigue: 0 });
+        }
+        let hits_0 = world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits;
+        let mut squad = ManagedSimSquad::new(0, vec![1, 2, 3, 4, 5, 6], pos(25, 25));
+        let mut min_range = 99u32;
+        for _ in 0..60 {
+            let intents = squad.step(&world);
+            resolve_tick(&mut world, &intents);
+            for c in world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()) {
+                min_range = min_range.min(c.pos.get_range_to(pos(25, 25)));
+            }
+        }
+        let hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
+        assert_eq!(min_range, 1, "the melee+heal squad closed to range 1 of the structure");
+        assert!(hits_1 < hits_0, "and dismantled it under tower fire ({hits_0} -> {hits_1})");
+    }
 }
