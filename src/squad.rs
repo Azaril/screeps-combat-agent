@@ -323,6 +323,11 @@ impl ManagedSimSquad {
                     melee_power: f.working_parts(Part::Attack) as u32 * screeps_combat_engine::constants::ATTACK_POWER,
                     ranged_power: f.working_parts(Part::RangedAttack) as u32 * screeps_combat_engine::constants::RANGED_ATTACK_POWER,
                     damage_taken_last_tick: 0,
+                    // ADR 0025: the synthetic id (so the kernel's heal intent resolves this ally) + the
+                    // structure-damage/declaim capabilities the kernel's action menu prices.
+                    id: f.id,
+                    dismantle_power: f.working_parts(Part::Work) as u32 * screeps_combat_engine::constants::DISMANTLE_POWER,
+                    claim_power: f.working_parts(Part::Claim) as u32 * screeps_combat_engine::constants::CONTROLLER_ATTACK_PER_PART,
                 }
             })
             .collect();
@@ -380,7 +385,14 @@ impl ManagedSimSquad {
             }
             let view_i = sim.view_for_with(fi, &member_dto, orders);
 
-            let actions: Vec<_> = decide_combat(&view_i).iter().filter_map(|ci| to_engine_action(ci, &sim)).collect();
+            // ADR 0025: when the kernel ran (Engaged, non-kiting) it already chose this member's ACTION
+            // jointly with its position — emit `member_intents` directly. Otherwise (kite/retreat/solo)
+            // fall back to the per-creep `decide_combat`.
+            let combat_intents = match decision.member_intents.get(idx) {
+                Some(ks) if !ks.is_empty() => ks.clone(),
+                _ => decide_combat(&view_i),
+            };
+            let actions: Vec<_> = combat_intents.iter().filter_map(|ci| to_engine_action(ci, &sim)).collect();
             if !actions.is_empty() {
                 intents.set(member_id, actions);
             }
