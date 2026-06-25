@@ -8,6 +8,7 @@
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Position, RoomName};
+use screeps_combat_decision::kite::{KiteThreat, KiteTower, ThreatField, ThreatKind};
 use screeps_combat_decision::CombatIntent;
 use screeps_combat_engine::{CombatWorld, CreepId, PlayerId};
 use screeps_rover::traits::CreepHandle;
@@ -18,13 +19,72 @@ use screeps_rover::{
     StuctureCostMatrixCache,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Search budget — the room is 2500 tiles; this comfortably covers a single-room plan.
 const MAX_OPS: u32 = 2000;
 /// Swamp tile cost baked into the matrix (matches rover's `CostMatrixOptions::default().swamp_cost`).
 const SWAMP_COST: u8 = 10;
+/// Plains tile cost (matches rover's `CostMatrixOptions::default().plains_cost`) — the base a threat
+/// stamp is added on top of for a non-swamp tile.
+const PLAINS_COST: u8 = 2;
+/// ADR 0024 threat-weighted path cost (the "safest route" — don't get picked off en route). Scales the
+/// threat field's incoming hits/tick into an ADDITIVE per-tile traversal cost: `add = (raw / DIV) cap
+/// CAP`, kept small + HARD-CAPPED so a threatened tile is *preferred against* but always cheaply
+/// PASSABLE (never a wall) — a fully-threatened approach must stay traversable or the squad can never
+/// close. Seed values; the EXP-*/SquadTacticParams sweep is the sanctioned tuner.
+const THREAT_PATH_DIV: i32 = 150;
+const THREAT_PATH_CAP: i32 = 8;
+
+/// The in-room incoming-hits field from `me_owner`'s hostiles + towers (the same [`ThreatField`] the
+/// kite scorer uses) — the source of the threat-weighted path cost. Only `attack_power`/`ranged_power`/
+/// tower position feed the stamp, so `kind`/`reach`/`step_ticks` are dummies here.
+fn room_threat_field(world: &CombatWorld, room: RoomName, me_owner: PlayerId) -> ThreatField {
+    let threats: Vec<KiteThreat> = world
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner != me_owner && c.pos.room_name() == room)
+        .map(|c| KiteThreat {
+            pos: c.pos,
+            kind: ThreatKind::MeleeOnly,
+            reach: 0,
+            step_ticks: None,
+            attack_power: c.body.attack_power(),
+            ranged_power: c.body.ranged_attack_power(),
+        })
+        .collect();
+    let towers: Vec<KiteTower> =
+        world.towers.iter().filter(|t| t.is_alive() && t.pos.room_name() == room).map(|t| KiteTower { pos: t.pos }).collect();
+    ThreatField::build(&threats, &towers)
+}
+
+/// Per-tile additive-applied threat cost for `room`: for every tile the field covers (and that isn't a
+/// wall), the final matrix value `(base terrain + scaled threat)` capped passable. Returns a SPARSE
+/// list (only threatened tiles) — empty when there are no threats, so the matrix is byte-identical to
+/// the threat-free build. `walls` are excluded (they stay impassable).
+fn threat_cost_tiles(tf: &ThreatField, room: RoomName, swamps: &std::collections::HashSet<(u8, u8)>, walls: &std::collections::HashSet<(u8, u8)>) -> Vec<(u8, u8, u8)> {
+    let mut out = Vec::new();
+    for x in 0..50u8 {
+        for y in 0..50u8 {
+            if walls.contains(&(x, y)) {
+                continue;
+            }
+            let xy = match (screeps::RoomCoordinate::new(x), screeps::RoomCoordinate::new(y)) {
+                (Ok(cx), Ok(cy)) => Position::new(cx, cy, room),
+                _ => continue,
+            };
+            let raw = tf.raw_at(xy);
+            if raw <= 0 {
+                continue;
+            }
+            let base = if swamps.contains(&(x, y)) { SWAMP_COST as i32 } else { PLAINS_COST as i32 };
+            let add = (raw / THREAT_PATH_DIV).min(THREAT_PATH_CAP);
+            out.push((x, y, (base + add).min(254) as u8));
+        }
+    }
+    out
+}
 
 /// A [`CostMatrixDataSource`] over a `CombatWorld` snapshot. It owns its data (no borrow of the
 /// world), satisfying the `'static` bound `CostMatrixSystem` places on its boxed data source. Every
@@ -40,6 +100,9 @@ struct CombatCostSource {
     swamps: Vec<(u8, u8)>,
     blockers: Vec<(u8, u8)>,
     hostiles: Vec<(u8, u8)>,
+    /// ADR 0024 threat-weighted path cost: `(x, y, final-cost)` for threatened non-wall tiles (sparse;
+    /// empty ⇒ byte-identical to the threat-free matrix).
+    threat: Vec<(u8, u8, u8)>,
 }
 
 impl CombatCostSource {
@@ -56,10 +119,15 @@ impl CombatCostSource {
             blockers.push((t.pos.x().u8(), t.pos.y().u8()));
         }
         let terrain = world.terrain_for(room);
+        let walls: Vec<(u8, u8)> = terrain.walls.iter().copied().collect();
+        let swamps: Vec<(u8, u8)> = terrain.swamps.iter().copied().collect();
+        let wall_set: std::collections::HashSet<(u8, u8)> = walls.iter().chain(&blockers).copied().collect();
+        let swamp_set: std::collections::HashSet<(u8, u8)> = swamps.iter().copied().collect();
+        let threat = threat_cost_tiles(&room_threat_field(world, room, me_owner), room, &swamp_set, &wall_set);
         Self {
             room,
-            walls: terrain.walls.iter().copied().collect(),
-            swamps: terrain.swamps.iter().copied().collect(),
+            walls,
+            swamps,
             blockers,
             hostiles: world
                 .creeps
@@ -67,6 +135,7 @@ impl CombatCostSource {
                 .filter(|c| c.is_alive() && c.owner != me_owner && c.pos.room_name() == room)
                 .map(|c| (c.pos.x().u8(), c.pos.y().u8()))
                 .collect(),
+            threat,
         }
     }
 }
@@ -77,9 +146,13 @@ impl CostMatrixDataSource for CombatCostSource {
             return None;
         }
         let mut other = LinearCostMatrix::new();
-        // Swamps first, then impassables — later `set`s win on a tile (apply order = push order).
+        // Swamps, then threat (base+scaled, overwrites swamp/plains), then impassables — later `set`s win
+        // on a tile (apply order), so walls always beat a threat stamp and stay impassable.
         for &(x, y) in &self.swamps {
             other.set(x, y, SWAMP_COST);
+        }
+        for &(x, y, cost) in &self.threat {
+            other.set(x, y, cost);
         }
         for &(x, y) in self.walls.iter().chain(&self.blockers) {
             other.set(x, y, u8::MAX);
@@ -305,6 +378,8 @@ struct RoomObstacles {
     swamps: Vec<(u8, u8)>,
     blockers: Vec<(u8, u8)>,
     hostiles: Vec<(u8, u8)>,
+    /// ADR 0024 threat-weighted path cost per tile (sparse; empty ⇒ byte-identical to threat-free).
+    threat: Vec<(u8, u8, u8)>,
 }
 
 /// Multi-room [`CostMatrixDataSource`] over a whole `CombatWorld` snapshot (vs the single-room
@@ -343,6 +418,18 @@ impl CombatWorldCostSource {
             entry.walls.extend(terrain.walls.iter().copied());
             entry.swamps.extend(terrain.swamps.iter().copied());
         }
+        // ADR 0024 threat-weighted path cost, per room (from that room's hostiles + towers).
+        let room_names: Vec<RoomName> = rooms.keys().copied().collect();
+        for name in room_names {
+            let (swamp_set, wall_set) = {
+                let o = rooms.get(&name).expect("just iterated keys");
+                let s: HashSet<(u8, u8)> = o.swamps.iter().copied().collect();
+                let w: HashSet<(u8, u8)> = o.walls.iter().chain(&o.blockers).copied().collect();
+                (s, w)
+            };
+            let threat = threat_cost_tiles(&room_threat_field(world, name, me_owner), name, &swamp_set, &wall_set);
+            rooms.get_mut(&name).expect("just iterated keys").threat = threat;
+        }
         Self { rooms }
     }
 }
@@ -353,6 +440,9 @@ impl CostMatrixDataSource for CombatWorldCostSource {
         if let Some(o) = self.rooms.get(&room_name) {
             for &(x, y) in &o.swamps {
                 other.set(x, y, SWAMP_COST);
+            }
+            for &(x, y, cost) in &o.threat {
+                other.set(x, y, cost);
             }
             for &(x, y) in o.walls.iter().chain(&o.blockers) {
                 other.set(x, y, u8::MAX);
@@ -467,6 +557,34 @@ mod tests {
             "open room → step east toward the goal, got {:?}",
             dir
         );
+    }
+
+    #[test]
+    fn threat_field_raises_cost_near_a_tower_but_stays_passable() {
+        // ADR 0024 Stage 1: a hostile tower stamps an ADDITIVE per-tile threat cost around it — higher
+        // than plains so the rover routes around exposure, but capped well below impassable so a
+        // threatened approach is always traversable. The tower's own tile stays a hard blocker.
+        use screeps_combat_engine::SimTower;
+        let world = CombatWorld {
+            towers: vec![SimTower { id: 1, owner: 1, pos: pos(10, 10), energy: 1000, hits: 3000, hits_max: 3000 }],
+            ..Default::default()
+        };
+        let m = build_combat_matrix(&world, room(), 0).expect("matrix");
+        let near = m.get(pos(10, 12).xy()); // range 2 of the tower (full ~600 damage)
+        let far = m.get(pos(45, 45).xy()); // range 35 (a tower hits the WHOLE room at its ~150 floor)
+        assert!(near > far, "closer to the tower costs more (the routing gradient): near={near} far={far}");
+        assert!(near < u8::MAX && far < u8::MAX, "threatened tiles stay PASSABLE (never a wall): near={near} far={far}");
+        assert!(far > PLAINS_COST, "a tower threatens the whole room (min damage everywhere): far={far}");
+        assert_eq!(m.get(pos(10, 10).xy()), u8::MAX, "the tower's own tile stays impassable");
+    }
+
+    #[test]
+    fn no_threats_matrix_is_byte_identical_plains() {
+        // No creeps/towers → empty threat field → plains tiles stay 0 (byte-identical to pre-Stage-1).
+        let world = CombatWorld::default();
+        let m = build_combat_matrix(&world, room(), 0).expect("matrix");
+        assert_eq!(m.get(pos(25, 25).xy()), 0, "plains tile unchanged with no threats");
+        assert_eq!(m.get(pos(5, 5).xy()), 0);
     }
 
     #[test]
