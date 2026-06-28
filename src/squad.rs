@@ -234,6 +234,11 @@ pub struct ManagedSimSquad {
     /// Whether the resolver may shove/swap others to reach a tile (the rover default). Off = A/B the
     /// effect of shoving on positioning (the investigated control).
     shove_enabled: bool,
+    /// ADR 0031 #39 — field this squad in a TOWER-DRAIN stance: the decision holds the falloff standoff
+    /// while the finite towers bleed dry (the unwinnable veto's drain exception), then advances + breaches.
+    /// Set by the drain-tactic proving test ([`Self::with_drain_stance`]); default `false` (every other
+    /// squad takes the byte-unchanged breach/engage path). Drain comps do NOT reach the live bot at P1.
+    drain_stance: bool,
 }
 
 /// Consecutive no-enemy-HP-progress ticks before a Destroy squad treats the fight as a stalemate and
@@ -254,6 +259,7 @@ impl ManagedSimSquad {
             prev_enemy_hits: None,
             stall_ticks: 0,
             shove_enabled: true,
+            drain_stance: false,
         }
     }
 
@@ -261,6 +267,13 @@ impl ManagedSimSquad {
     /// positioning). Default on (the rover default).
     pub fn with_shove(mut self, shove: bool) -> Self {
         self.shove_enabled = shove;
+        self
+    }
+
+    /// ADR 0031 #39 — field this squad in a tower-DRAIN stance (the drain-tactic proving vehicle): the
+    /// decision holds the falloff standoff while the finite towers bleed dry, then advances + breaches.
+    pub fn with_drain_stance(mut self, drain: bool) -> Self {
+        self.drain_stance = drain;
         self
     }
 
@@ -352,6 +365,7 @@ impl ManagedSimSquad {
             enemy_safe_mode: world.safe_mode_owner.is_some_and(|o| o != self.owner),
             engage_objective: self.intent,
             enemy_stalled,
+            drain_stance: self.drain_stance,
         };
         let decision = decide_squad_with_pathing(&view, None, self.tactics, &mut |r| build_combat_matrix(world, r, self.owner), MAX_KITE_OPS);
         self.state = decision.state;
@@ -756,5 +770,92 @@ mod tests {
         let hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
         assert_eq!(min_range, 1, "the melee+heal squad closed to range 1 of the structure");
         assert!(hits_1 < hits_0, "and dismantled it under tower fire ({hits_0} -> {hits_1})");
+    }
+
+    #[test]
+    fn a_drain_squad_bleeds_finite_towers_dry_then_breaches() {
+        // ADR 0031 #39 P1 — THE MAKE-OR-BREAK: a managed TOUGH+HEAL(+WORK) drain squad in the drain stance
+        // vs a FINITE-energy multi-tower nest (driven by the scripted `tower_intents`). It must:
+        //   (1) HOLD the falloff standoff (not charge into the point-blank tower dps and die / not retreat
+        //       on the unwinnable veto — the drain-scoped exception lets it hold), while
+        //   (2) the towers BLEED to 0 energy (10/shot/tick under sustained fire), then
+        //   (3) ADVANCE on the dead base and DISMANTLE it (the DRY→ADVANCE transition).
+        // This is the runtime drain tactic flowing through the SAME `decide_squad_with_pathing` the live
+        // bot runs — proven offline on the bit-deterministic sim. If this can't be made to work it's
+        // reported honestly, not faked.
+        use crate::opponents::tower_intents;
+        use crate::scenario::ScenarioBuilder;
+        use screeps_combat_engine::StructureKind;
+
+        let mut b = ScenarioBuilder::empty(room());
+        let spawn_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 30_000, 30_000);
+        // TWO finite-energy towers flanking the core. 800 energy each ⇒ 80 shots to dry. Point-blank (≤5)
+        // they deal 2×600 = 1200/tick — un-out-healable by a single squad (a breach is vetoed); but they're
+        // FINITE, so the drain standoff works. At the falloff FLOOR (range ≥20) they deal 2×150 = 300/tick,
+        // which the drain tank's 432/tick self-heal beats with the sustain margin → a valid standoff exists.
+        b.tower(1, 24, 25, 800);
+        b.tower(1, 26, 25, 800);
+        let mut world = b.build();
+
+        // The drain squad. A dedicated SOLO tank proves the tactic unambiguously: the towers concentrate on
+        // the nearest creep, so the soaking tank must SOLO out-heal the aggregate falloff fire (cross-healing
+        // from co-located members is a P2 efficiency win, not part of the tactic proof). The tank carries 36
+        // HEAL (×12 = 432/tick self-heal > the 300/tick falloff floor of two towers, with margin), TOUGH for
+        // an HP buffer, WORK to dismantle the dead base after the drain, and enough MOVE to hold/reposition.
+        let drain_body = {
+            let mut v = vec![Part::Tough; 2];
+            v.extend(std::iter::repeat_n(Part::Heal, 36));
+            v.extend(std::iter::repeat_n(Part::Work, 4));
+            v.extend(std::iter::repeat_n(Part::Move, 8));
+            v
+        };
+        // Start it already AT the standoff (range ~20 west of the nest) so the proof is the drain + breach,
+        // not the approach transient (the approach is the same Drain directive; the standoff move is tested
+        // by the decision unit tests).
+        world.creeps.push(SimCreep { id: 1, owner: 0, pos: pos(5, 25), body: SimBody::unboosted(&drain_body), fatigue: 0 });
+        let total_tower_energy = |w: &CombatWorld| w.towers.iter().filter(|t| t.owner == 1).map(|t| t.energy).sum::<u32>();
+        let start_energy = total_tower_energy(&world);
+        assert!(start_energy > 0, "the bed has energized finite towers");
+        let core_hits_0 = world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits;
+
+        let mut squad = ManagedSimSquad::new(0, vec![1], pos(25, 25)).with_drain_stance(true);
+        let mut towers_dried_at: Option<u32> = None;
+        let mut min_range_after_dry = 99u32;
+        let mut all_dead = false;
+        for tick in 0..600u32 {
+            let mut intents = squad.step(&world);
+            // The defender's scripted tower AI fires at the nearest attacker (drains energy via can_fire).
+            tower_intents(&world, &mut intents);
+            resolve_tick(&mut world, &intents);
+
+            if towers_dried_at.is_none() && total_tower_energy(&world) == 0 {
+                towers_dried_at = Some(tick);
+            }
+            // After the drain, track how close the squad gets to the core (the breach advance).
+            if towers_dried_at.is_some() {
+                for c in world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()) {
+                    min_range_after_dry = min_range_after_dry.min(c.pos.get_range_to(pos(25, 25)));
+                }
+            }
+            if world.creeps.iter().filter(|c| c.owner == 0).all(|c| !c.is_alive()) {
+                all_dead = true;
+                break;
+            }
+            if world.structures.iter().find(|s| s.id == spawn_id).is_none_or(|s| !s.is_alive()) {
+                break; // core destroyed
+            }
+        }
+
+        let survivors = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
+        let core_hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
+
+        assert!(!all_dead, "the drain squad survived the soak (it held the standoff + out-healed the falloff fire)");
+        assert!(survivors > 0, "at least one drainer lived to breach");
+        // (1)+(2) the finite towers BLED to 0.
+        assert_eq!(total_tower_energy(&world), 0, "the towers bled to 0 energy (start {start_energy})");
+        assert!(towers_dried_at.is_some(), "the drain reached dry towers");
+        // (3) DRY→ADVANCE: after the drain the squad closed on the dead base and dismantled it.
+        assert!(min_range_after_dry <= 3, "after the drain the squad advanced onto the dead base (min range {min_range_after_dry})");
+        assert!(core_hits_1 < core_hits_0, "and dismantled the core ({core_hits_0} -> {core_hits_1})");
     }
 }
