@@ -20,10 +20,13 @@ use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority
 
 /// Members within this Chebyshev distance of their slot count as "in formation".
 const COHESION_TOL: u32 = 1;
-/// Advance the anchor only when at least this fraction of members are in formation.
-const ADVANCE_QUORUM: f32 = 0.75;
-/// Loose-mode (blob / corridor) cohesion radius — members within this of the anchor are gathered.
-const LOOSE_RADIUS: u32 = 3;
+/// Advance the anchor only when at least this fraction of members are in formation. ALIASES the shared
+/// `rally::GATHER_QUORUM_RATIO` so the sim's assault-advance gate and the live bot's gather quorum use ONE
+/// constant (the movement-stall fix — they can't drift).
+const ADVANCE_QUORUM: f32 = screeps_combat_decision::rally::GATHER_QUORUM_RATIO;
+/// Loose-mode (blob / corridor) cohesion radius — members within this of the anchor are gathered. ALIASES
+/// the shared `rally::RALLY_GATHER_RADIUS` (same reason).
+const LOOSE_RADIUS: u32 = screeps_combat_decision::rally::RALLY_GATHER_RADIUS;
 
 /// `anchor + (dx,dy)`, with an off-room offset **folded** back into the room (mirrored). Near a room
 /// edge a formation's far slots would land off-map; folding keeps them as DISTINCT in-room tiles so
@@ -118,7 +121,14 @@ impl SimSquad {
         // members then re-gather into their slots.
         let blob = self.members.len() > 4;
         let box_rate = cohesion::measure(&positions, Some((anchor_pos, &self.layout)), COHESION_TOL).in_formation_rate;
-        let near_anchor = positions.iter().filter(|p| p.get_range_to(anchor_pos) <= LOOSE_RADIUS).count() as f32 / n;
+        // Gathered-near-anchor count via the SHARED rally kernel (`members_gathered_at`) — the SAME
+        // instrument the live bot's gather quorum uses, so the sim's assault-advance gate and the bot's
+        // can't drift (the movement-stall root cause). `LOOSE_RADIUS == rally::RALLY_GATHER_RADIUS` and
+        // `ADVANCE_QUORUM == rally::GATHER_QUORUM_RATIO`, so this is byte-equivalent to the prior inline
+        // count/ratio — the drain agent-sim test stays unchanged.
+        let anchor_opts: Vec<Option<Position>> = positions.iter().map(|p| Some(*p)).collect();
+        let near_anchor =
+            screeps_combat_decision::rally::members_gathered_at(&anchor_opts, anchor_pos, LOOSE_RADIUS) as f32 / n;
 
         // Gate: a strung-out (loose) squad or a blob advances on centroid proximity (so it can keep
         // threading / re-gathering); a formed box advances only when actually in box formation.
