@@ -907,12 +907,12 @@ mod tests {
                 .collect(),
             breach_hits: 0,
             objective_hits: world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits,
-            enemy_dps: 0.0,
             repair_per_tick: 0.0,
             safe_mode: false,
         };
         let budget = ForceBudget { max_heal_per_tick: 432.0, max_dismantle_dps: 200.0, tank_effective_hp: 4_400.0, onsite_budget_ticks: 600 };
-        let assessment = assess(&defense, &budget);
+        // ADR 0031 #41: enemy creep dps is the explicit `assess` arg now (this bed has no defender creeps → 0).
+        let assessment = assess(&defense, 0.0, &budget);
         assert!(assessment.winnable, "the oracle finds the finite-tower bed winnable: {}", assessment.reason);
         assert_eq!(assessment.mode, AssaultMode::Drain, "and PICKS the drain (breach can't out-heal point-blank): {}", assessment.reason);
 
