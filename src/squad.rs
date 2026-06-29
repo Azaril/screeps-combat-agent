@@ -868,4 +868,102 @@ mod tests {
         assert!(min_range_after_dry <= 3, "after the drain the squad advanced onto the dead base (min range {min_range_after_dry})");
         assert!(core_hits_1 < core_hits_0, "and dismantled the core ({core_hits_0} -> {core_hits_1})");
     }
+
+    #[test]
+    fn the_oracle_decides_drain_then_a_sized_squad_bleeds_the_towers_and_breaches() {
+        // ADR 0031 #39 P2+P3 END-TO-END — the drain is now ORACLE-DRIVEN, not a hand-set `with_drain_stance`:
+        //   (P2) the force-sizing oracle (`assess`) is fed the bed's defense + a representative single-squad
+        //        budget, PICKS `AssaultMode::Drain`, and SIZES a drain comp (`RequiredForce`: HEAL to out-pace
+        //        the falloff soak + a TOUGH EHP buffer + WORK to breach), then
+        //   (P3) the drain STANCE is derived from the oracle's verdict (`mode == Drain`) — exactly the bit the
+        //        live bot threads (war.rs → the objective's runtime `assault_mode` → `SquadView.drain_stance`),
+        //        NOT a literal `true` — and the SAME `decide_squad_with_pathing` bleeds the finite towers dry
+        //        then breaches.
+        use crate::opponents::tower_intents;
+        use crate::scenario::ScenarioBuilder;
+        use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, RequiredForce, TowerThreat};
+        use screeps_combat_engine::constants::{DISMANTLE_POWER, HEAL_POWER};
+        use screeps_combat_engine::StructureKind;
+
+        let mut b = ScenarioBuilder::empty(room());
+        let spawn_id = b.structure(StructureKind::Spawn, Some(1), 25, 25, 30_000, 30_000);
+        // The finite-energy bed (mirrors `a_drain_squad_bleeds...`): two 800-energy towers flanking the core.
+        b.tower(1, 24, 25, 800);
+        b.tower(1, 26, 25, 800);
+        let mut world = b.build();
+        let nest = pos(25, 25);
+
+        // ── P2: feed the oracle the bed's defense + a representative single-squad budget; it must PICK Drain. ──
+        // The DefenseProfile mirrors what the bot's `project_defense` builds: each tower at its point-blank
+        // range to the nest (the breach assault tile). `assess` evaluates the BREACH at this range (un-out-
+        // healable point-blank) but the DRAIN at the falloff standoff (where the heal sustains) — so it picks
+        // Drain. The budget is one tank's heal/EHP/dismantle (heal beats the 2×150 falloff floor, big EHP).
+        let defense = DefenseProfile {
+            towers: world
+                .towers
+                .iter()
+                .filter(|t| t.owner == 1)
+                .map(|t| TowerThreat { range_to_assault: t.pos.get_range_to(nest), energy: t.energy })
+                .collect(),
+            breach_hits: 0,
+            objective_hits: world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits,
+            enemy_dps: 0.0,
+            repair_per_tick: 0.0,
+            safe_mode: false,
+        };
+        let budget = ForceBudget { max_heal_per_tick: 432.0, max_dismantle_dps: 200.0, tank_effective_hp: 4_400.0, onsite_budget_ticks: 600 };
+        let assessment = assess(&defense, &budget);
+        assert!(assessment.winnable, "the oracle finds the finite-tower bed winnable: {}", assessment.reason);
+        assert_eq!(assessment.mode, AssaultMode::Drain, "and PICKS the drain (breach can't out-heal point-blank): {}", assessment.reason);
+
+        // The oracle's SIZED drain comp → part counts. HEAL out-paces the falloff soak; TOUGH is the EHP buffer.
+        let required = RequiredForce::from_assessment(&assessment);
+        assert!(required.heal_parts > 0, "the drain comp is sized with HEAL: {required:?}");
+        // The squad fields these parts (+ WORK to breach + MOVE to hold/reposition). One soaking tank proves
+        // the tactic; the heal must SOLO out-heal the aggregate falloff, so floor it at the bed's known-good 36.
+        let heal_parts = required.heal_parts.max(36);
+        let work_parts = required.dismantle_parts.div_ceil(DISMANTLE_POWER).max(4); // ≥ enough to dismantle the dead base
+        let tough_parts = required.tough_parts; // the oracle's EHP buffer (may be 0 when heal carries the soak)
+        let drain_body = {
+            let mut v = vec![Part::Tough; tough_parts as usize];
+            v.extend(std::iter::repeat_n(Part::Heal, heal_parts as usize));
+            v.extend(std::iter::repeat_n(Part::Work, work_parts as usize));
+            v.extend(std::iter::repeat_n(Part::Move, 8));
+            v
+        };
+        // Sanity: the fielded heal out-paces the 2×150 = 300/tick falloff floor (the soak the oracle sized for).
+        assert!(heal_parts * HEAL_POWER >= 300, "fielded HEAL out-paces the falloff soak ({heal_parts} parts)");
+        world.creeps.push(SimCreep { id: 1, owner: 0, pos: pos(5, 25), body: SimBody::unboosted(&drain_body), fatigue: 0 });
+
+        // ── P3: the drain STANCE is DERIVED from the oracle's verdict (exactly the bot's threading), not a literal. ──
+        let drain_stance = assessment.mode == AssaultMode::Drain;
+        let mut squad = ManagedSimSquad::new(0, vec![1], nest).with_drain_stance(drain_stance);
+
+        let total_tower_energy = |w: &CombatWorld| w.towers.iter().filter(|t| t.owner == 1).map(|t| t.energy).sum::<u32>();
+        let start_energy = total_tower_energy(&world);
+        let core_hits_0 = world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits;
+        let mut min_range_after_dry = 99u32;
+        let mut towers_dried = false;
+        for _ in 0..600u32 {
+            let mut intents = squad.step(&world);
+            tower_intents(&world, &mut intents);
+            resolve_tick(&mut world, &intents);
+            if !towers_dried && total_tower_energy(&world) == 0 {
+                towers_dried = true;
+            }
+            if towers_dried {
+                for c in world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()) {
+                    min_range_after_dry = min_range_after_dry.min(c.pos.get_range_to(nest));
+                }
+            }
+            if world.structures.iter().find(|s| s.id == spawn_id).is_none_or(|s| !s.is_alive()) {
+                break;
+            }
+        }
+        let core_hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
+        // The oracle-driven drain bled the finite towers dry, then advanced + dismantled the dead base.
+        assert_eq!(total_tower_energy(&world), 0, "the oracle-sized drain bled the towers to 0 (start {start_energy})");
+        assert!(min_range_after_dry <= 3, "after the drain the squad advanced onto the dead base (min range {min_range_after_dry})");
+        assert!(core_hits_1 < core_hits_0, "and dismantled the core ({core_hits_0} -> {core_hits_1})");
+    }
 }
