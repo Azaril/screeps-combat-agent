@@ -909,6 +909,7 @@ mod tests {
             objective_hits: world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits,
             repair_per_tick: 0.0,
             safe_mode: false,
+            ..Default::default()
         };
         let budget = ForceBudget { max_heal_per_tick: 432.0, max_dismantle_dps: 200.0, tank_effective_hp: 4_400.0, onsite_budget_ticks: 600 };
         // ADR 0031 #41: enemy creep dps is the explicit `assess` arg now (this bed has no defender creeps → 0).
