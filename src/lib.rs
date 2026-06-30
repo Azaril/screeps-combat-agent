@@ -174,7 +174,7 @@ impl SimView {
                     + c.working_parts(Part::RangedAttack) as u32 * screeps_combat_engine::constants::RANGED_ATTACK_POWER
             })
             .sum();
-        let focus = select_focus_target(&hostiles, &structures, our_dps).filter(|f| f.id.is_some());
+        let focus = select_focus_target(&hostiles, &structures, our_dps, center).filter(|f| f.id.is_some());
 
         Self {
             tick: world.tick,
