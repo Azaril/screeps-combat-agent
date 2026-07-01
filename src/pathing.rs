@@ -314,8 +314,11 @@ pub fn move_request_from_intent(creep: CreepId, intent: &CombatIntent) -> Option
                 range: *range as u32,
             },
             priority: MovementPriority::Normal,
+            // Kernel defaults (byte-identical): no numeric-priority bid, run-config ladder.
+            priority_value: None,
             shove: true,
             anchor: None,
+            stuck_thresholds: None,
         }),
         _ => None,
     }
@@ -454,19 +457,36 @@ impl CostMatrixDataSource for CombatWorldCostSource {
     }
 }
 
+/// The COMBAT-domain mover defaults: [`MoverConfig::default`] with **`register_idle_creeps` OFF**.
+/// "Idle" is domain-dependent: an unrequested hauler is parked junk, but an unrequested COMBAT
+/// creep is usually HOLDING — an in-position shooter/tank that decided to attack, not move, this
+/// tick. Registering holders as shoveable idles lets squadmates displace them out of formation and
+/// dance-avoid their held tiles — measured as a drain-soak squad wiping (`RosterWiped`) and >10%
+/// period-2 positioning oscillation on the combat-eval beds the moment the kernel default flipped
+/// ON (2026-07-01). Split default, same discipline as the `ladder(8)` adjudication. The recorded
+/// end-state fix is to make HOLDING a first-class request (move_to own tile at `Immovable`), after
+/// which combat can re-adopt registration; until then combat opts out here, in ONE place.
+pub fn combat_mover_config() -> MoverConfig {
+    MoverConfig {
+        register_idle_creeps: false,
+        ..Default::default()
+    }
+}
+
 /// Run rover's `MovementSystem` (resolver included) over `world` for `owner`'s `requests`, returning
 /// the resolved per-creep directions to hand to `resolve_tick`. This is the **combat wrapper** around
 /// the kernel driver [`screeps_sim_core::resolve_moves_via_system`] (ADR 0033 M1): it injects the
 /// combat routing policy — [`CombatWorldCostSource`] (towers / ADR-0024 threat field / structures as
 /// obstacles) — and forwards the pure `MovementState`. `cache` persists per-creep path reuse +
 /// stuck-escalation across ticks. Traffic-managed, unified analogue of routing each creep alone.
+/// Defaults to [`combat_mover_config`] (NOT the kernel default — see its idle-registration note).
 pub fn resolve_moves_via_system(
     world: &CombatWorld,
     owner: PlayerId,
     requests: &[SimMoveRequest],
     cache: &mut SimMoveCache,
 ) -> HashMap<CreepId, Direction> {
-    resolve_moves_via_system_with(world, owner, requests, cache, &MoverConfig::default())
+    resolve_moves_via_system_with(world, owner, requests, cache, &combat_mover_config())
 }
 
 /// [`resolve_moves_via_system`] with explicit rover tunables — the combat analogue of the kernel's

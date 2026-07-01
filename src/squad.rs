@@ -328,7 +328,7 @@ impl ManagedSimSquad {
             stall_ticks: 0,
             shove_enabled: true,
             drain_stance: false,
-            mover_config: MoverConfig::default(),
+            mover_config: crate::pathing::combat_mover_config(),
         }
     }
 
@@ -632,7 +632,7 @@ mod tests {
             objective,
             loose: false,
             move_cache: SimMoveCache::default(),
-            mover_config: MoverConfig::default(),
+            mover_config: crate::pathing::combat_mover_config(),
         }
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
             objective: pos(30, 25),
             loose: false,
             move_cache: SimMoveCache::default(),
-            mover_config: MoverConfig::default(),
+            mover_config: crate::pathing::combat_mover_config(),
         };
         for _ in 0..90 {
             let (intents, _) = squad.step(&world);
