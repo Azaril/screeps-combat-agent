@@ -17,6 +17,10 @@ screeps-game-api = "0.23"
 # the root Cargo.toml [patch] table redirects them to the local working tree in-workspace.
 screeps-combat-engine = { git = "https://github.com/Azaril/screeps-combat-engine" }
 screeps-combat-decision = { git = "https://github.com/Azaril/screeps-combat-decision" }
+# The shared movement/world kernel (ADR 0033): the per-part action-power constants live here now.
+# `rover` feature = the offline `resolve_moves_via_system` driver this crate wraps with its own
+# combat cost source (towers/threat/structures); the generic mover mechanism lives in the kernel.
+screeps-sim-core = { git = "https://github.com/Azaril/screeps-sim-core", features = ["rover"] }
 # Rover WITHOUT the `screeps` feature = its pure headless core (LocalPathfinder + the cost-matrix
 # builder), so the sim plans paths through the same system as live, with no JS (P2.M-bridge).
 screeps-rover = { git = "https://github.com/Azaril/screeps-rover" }

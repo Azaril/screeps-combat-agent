@@ -18,8 +18,10 @@
 use crate::pathing::resolve_move_direction;
 use screeps::Position;
 use screeps_combat_decision::CombatIntent;
+use screeps_combat_engine::SimBodyCombat;
 use screeps_combat_engine::{
-    resolve_tick, CombatAction, CombatWorld, Intents, PlayerId, StructureId, StructureKind, TowerAction,
+    resolve_tick, CombatAction, CombatWorld, Intents, PlayerId, StructureId, StructureKind,
+    TowerAction,
 };
 
 /// Who won the siege.
@@ -47,9 +49,15 @@ pub struct SiegeOutcome {
 /// them to `intents` so the caller can layer the defense over the attacker's intents. `core_owner`
 /// defends; `core_pos` is the focus anchor (towers focus the hostile closest to it). No-op offense
 /// when there are no hostiles (towers still maintain).
-pub fn defense_intents(world: &CombatWorld, core_owner: PlayerId, core_pos: Position, intents: &mut Intents) {
+pub fn defense_intents(
+    world: &CombatWorld,
+    core_owner: PlayerId,
+    core_pos: Position,
+    intents: &mut Intents,
+) {
     // focusClosest: the hostile (non-defender) nearest the core is the focus target.
     let focus = world
+        .movement
         .creeps
         .iter()
         .filter(|c| c.is_alive() && c.owner != core_owner)
@@ -65,6 +73,7 @@ pub fn defense_intents(world: &CombatWorld, core_owner: PlayerId, core_pos: Posi
     // towersMaintenance: reserve ONE tower to heal the most-damaged defender, else repair the
     // most-damaged owned rampart (the active-repair sustain). Heal takes priority over repair.
     let damaged_defender = world
+        .movement
         .creeps
         .iter()
         .filter(|c| c.is_alive() && c.owner == core_owner && c.body.hits < c.body.hits_max())
@@ -96,7 +105,12 @@ pub fn defense_intents(world: &CombatWorld, core_owner: PlayerId, core_pos: Posi
         for tid in &towers {
             intents.set_tower(*tid, TowerAction::Attack(t.id));
         }
-        for d in world.creeps.iter().filter(|c| c.is_alive() && c.owner == core_owner) {
+        for d in world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.is_alive() && c.owner == core_owner)
+        {
             let r = d.pos.get_range_to(t.pos);
             let action = if d.body.ranged_attack_power() > 0 && r <= 3 {
                 Some(if r == 1 {
@@ -127,7 +141,12 @@ pub fn dismantler_intents(
     core_pos: Position,
 ) -> Intents {
     let mut intents = Intents::new();
-    for c in world.creeps.iter().filter(|c| c.is_alive() && c.owner == attacker_owner) {
+    for c in world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner == attacker_owner)
+    {
         // The nearest living rampart still walling the core is the gate; once none remain, the core.
         let rampart = world
             .structures
@@ -140,9 +159,15 @@ pub fn dismantler_intents(
         };
         if c.pos.get_range_to(target_pos) <= 1 {
             intents.set(c.id, vec![CombatAction::Dismantle(target_id)]);
-        } else if let Some(dir) =
-            resolve_move_direction(world, c.pos, attacker_owner, &CombatIntent::MoveTo { target: target_pos, range: 1 })
-        {
+        } else if let Some(dir) = resolve_move_direction(
+            world,
+            c.pos,
+            attacker_owner,
+            &CombatIntent::MoveTo {
+                target: target_pos,
+                range: 1,
+            },
+        ) {
             intents.set_move(c.id, dir);
         }
     }
@@ -162,8 +187,13 @@ pub fn run_siege(
     attacker: &mut dyn FnMut(&CombatWorld) -> Intents,
     max_ticks: u32,
 ) -> SiegeOutcome {
-    let attacker_count =
-        |w: &CombatWorld| w.creeps.iter().filter(|c| c.is_alive() && c.owner != core_owner).count();
+    let attacker_count = |w: &CombatWorld| {
+        w.movement
+            .creeps
+            .iter()
+            .filter(|c| c.is_alive() && c.owner != core_owner)
+            .count()
+    };
     // The core may be a structure or (future) a tower — look in both pools by id.
     let core_hits = |w: &CombatWorld| {
         w.structures
@@ -178,13 +208,28 @@ pub fn run_siege(
         let ch = core_hits(&world);
         let alive = attacker_count(&world);
         if ch == 0 {
-            return SiegeOutcome { result: SiegeResult::CoreBreached, ticks, core_hits: 0, attackers_alive: alive };
+            return SiegeOutcome {
+                result: SiegeResult::CoreBreached,
+                ticks,
+                core_hits: 0,
+                attackers_alive: alive,
+            };
         }
         if alive == 0 {
-            return SiegeOutcome { result: SiegeResult::AttackersWiped, ticks, core_hits: ch, attackers_alive: 0 };
+            return SiegeOutcome {
+                result: SiegeResult::AttackersWiped,
+                ticks,
+                core_hits: ch,
+                attackers_alive: 0,
+            };
         }
         if ticks >= max_ticks {
-            return SiegeOutcome { result: SiegeResult::Held, ticks, core_hits: ch, attackers_alive: alive };
+            return SiegeOutcome {
+                result: SiegeResult::Held,
+                ticks,
+                core_hits: ch,
+                attackers_alive: alive,
+            };
         }
         let mut intents = attacker(&world);
         defense_intents(&world, core_owner, core_pos, &mut intents);
@@ -207,7 +252,11 @@ mod tests {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
 
     /// Core (owned spawn) at (25,25) behind a rampart at (24,25), a defending tower at (25,27), with
@@ -219,12 +268,13 @@ mod tests {
         let core_id = b.structure(StructureKind::Spawn, Some(DEFENDER), 25, 25, 3000, 3000);
         b.tower(DEFENDER, 25, 27, 100_000); // amply energized → a sustained core
         let mut world = b.rampart(DEFENDER, 24, 25, rampart_hits).build();
-        world.creeps.push(SimCreep {
+        world.movement.creeps.push(SimCreep {
             id: 1,
             owner: ATTACKER,
             pos: pos(23, 25),
             body: SimBody::unboosted(attacker_parts),
             fatigue: 0,
+            carry_used: 0,
         });
         (world, core_id)
     }
@@ -252,8 +302,15 @@ mod tests {
             &mut |w| dismantler_intents(w, ATTACKER, core_id, pos(25, 25)),
             300,
         );
-        assert_ne!(outcome.result, SiegeResult::CoreBreached, "an under-gunned attacker must not breach");
-        assert_eq!(outcome.core_hits, 3000, "the core took no damage — the rampart held");
+        assert_ne!(
+            outcome.result,
+            SiegeResult::CoreBreached,
+            "an under-gunned attacker must not breach"
+        );
+        assert_eq!(
+            outcome.core_hits, 3000,
+            "the core took no damage — the rampart held"
+        );
     }
 
     #[test]
@@ -269,7 +326,12 @@ mod tests {
             &mut |w| dismantler_intents(w, ATTACKER, core_id, pos(25, 25)),
             300,
         );
-        assert_eq!(outcome.result, SiegeResult::CoreBreached, "sufficient DPS breaches; got {:?}", outcome);
+        assert_eq!(
+            outcome.result,
+            SiegeResult::CoreBreached,
+            "sufficient DPS breaches; got {:?}",
+            outcome
+        );
         assert_eq!(outcome.core_hits, 0);
     }
 
@@ -283,15 +345,37 @@ mod tests {
         b.tower(DEFENDER, 25, 24, 100_000);
         let mut world = b.build();
         // A damaged defender (lost some hits) + an attacker.
-        let mut hurt = SimCreep { id: 50, owner: DEFENDER, pos: pos(26, 25), body: SimBody::unboosted(&[Part::Attack, Part::Move]), fatigue: 0 };
+        let mut hurt = SimCreep {
+            id: 50,
+            owner: DEFENDER,
+            pos: pos(26, 25),
+            body: SimBody::unboosted(&[Part::Attack, Part::Move]),
+            fatigue: 0,
+            carry_used: 0,
+        };
         hurt.body.hits = 50; // below hits_max → a heal target
-        world.creeps.push(hurt);
-        world.creeps.push(SimCreep { id: 1, owner: ATTACKER, pos: pos(20, 25), body: SimBody::unboosted(&[Part::Attack, Part::Move]), fatigue: 0 });
+        world.movement.creeps.push(hurt);
+        world.movement.creeps.push(SimCreep {
+            id: 1,
+            owner: ATTACKER,
+            pos: pos(20, 25),
+            body: SimBody::unboosted(&[Part::Attack, Part::Move]),
+            fatigue: 0,
+            carry_used: 0,
+        });
 
         let mut intents = Intents::new();
         defense_intents(&world, DEFENDER, pos(25, 25), &mut intents);
-        let heals = intents.towers.values().filter(|a| matches!(a, TowerAction::Heal(50))).count();
-        let attacks = intents.towers.values().filter(|a| matches!(a, TowerAction::Attack(1))).count();
+        let heals = intents
+            .towers
+            .values()
+            .filter(|a| matches!(a, TowerAction::Heal(50)))
+            .count();
+        let attacks = intents
+            .towers
+            .values()
+            .filter(|a| matches!(a, TowerAction::Attack(1)))
+            .count();
         assert_eq!(heals, 1, "one tower heals the damaged defender");
         assert_eq!(attacks, 1, "the other tower attacks the closest hostile");
     }
@@ -310,15 +394,26 @@ mod tests {
         // The attacker AI: WORK creeps dismantle the nearest living rampart, then the core; HEAL creeps
         // heal the most-damaged ally (adjacent → Heal, ≤3 → RangedHeal). Mirrors the squad's
         // dismantler/healer roles. All units start in range, so no movement is needed (determinism).
-        fn sized_squad_intents(world: &CombatWorld, attacker: PlayerId, core_id: StructureId, core_pos: Position) -> Intents {
+        fn sized_squad_intents(
+            world: &CombatWorld,
+            attacker: PlayerId,
+            core_id: StructureId,
+            core_pos: Position,
+        ) -> Intents {
             let mut intents = Intents::new();
             let wounded = world
+                .movement
                 .creeps
                 .iter()
                 .filter(|c| c.is_alive() && c.owner == attacker)
                 .min_by_key(|c| c.body.hits)
                 .map(|c| (c.id, c.pos));
-            for c in world.creeps.iter().filter(|c| c.is_alive() && c.owner == attacker) {
+            for c in world
+                .movement
+                .creeps
+                .iter()
+                .filter(|c| c.is_alive() && c.owner == attacker)
+            {
                 if c.body.dismantle_power() > 0 {
                     let rampart = world
                         .structures
@@ -365,16 +460,39 @@ mod tests {
             .chain(std::iter::repeat_n(Part::Work, 25))
             .chain(std::iter::repeat_n(Part::Move, 17))
             .collect();
-        let healer: Vec<Part> = std::iter::repeat_n(Part::Heal, 23).chain(std::iter::repeat_n(Part::Move, 10)).collect();
+        let healer: Vec<Part> = std::iter::repeat_n(Part::Heal, 23)
+            .chain(std::iter::repeat_n(Part::Move, 10))
+            .collect();
         let core_pos = pos(25, 25);
 
         // ── SIZED: dismantler + THREE healers (≈828 heal/tick ≥ the worst-case ≈810 all-tower burst) ──
         let (mut world, core_id) = build_bed();
-        world.creeps.push(SimCreep { id: 1, owner: ATTACKER, pos: pos(24, 24), body: SimBody::unboosted(&dismantler), fatigue: 0 });
+        world.movement.creeps.push(SimCreep {
+            id: 1,
+            owner: ATTACKER,
+            pos: pos(24, 24),
+            body: SimBody::unboosted(&dismantler),
+            fatigue: 0,
+            carry_used: 0,
+        });
         for (i, (hx, hy)) in [(23u8, 24u8), (23, 23), (24, 23)].into_iter().enumerate() {
-            world.creeps.push(SimCreep { id: 2 + i as u32, owner: ATTACKER, pos: pos(hx, hy), body: SimBody::unboosted(&healer), fatigue: 0 });
+            world.movement.creeps.push(SimCreep {
+                id: 2 + i as u32,
+                owner: ATTACKER,
+                pos: pos(hx, hy),
+                body: SimBody::unboosted(&healer),
+                fatigue: 0,
+                carry_used: 0,
+            });
         }
-        let sized = run_siege(world, DEFENDER, core_id, core_pos, &mut |w| sized_squad_intents(w, ATTACKER, core_id, core_pos), 300);
+        let sized = run_siege(
+            world,
+            DEFENDER,
+            core_id,
+            core_pos,
+            &mut |w| sized_squad_intents(w, ATTACKER, core_id, core_pos),
+            300,
+        );
         assert_eq!(
             sized.result,
             SiegeResult::CoreBreached,
@@ -383,14 +501,38 @@ mod tests {
 
         // ── UNDER-HEALED: the same dismantler + ONE healer (≈276 heal ≪ the focus dps) → wiped first ──
         let (mut world, core_id) = build_bed();
-        world.creeps.push(SimCreep { id: 1, owner: ATTACKER, pos: pos(24, 24), body: SimBody::unboosted(&dismantler), fatigue: 0 });
-        world.creeps.push(SimCreep { id: 2, owner: ATTACKER, pos: pos(23, 24), body: SimBody::unboosted(&healer), fatigue: 0 });
-        let under = run_siege(world, DEFENDER, core_id, core_pos, &mut |w| sized_squad_intents(w, ATTACKER, core_id, core_pos), 300);
+        world.movement.creeps.push(SimCreep {
+            id: 1,
+            owner: ATTACKER,
+            pos: pos(24, 24),
+            body: SimBody::unboosted(&dismantler),
+            fatigue: 0,
+            carry_used: 0,
+        });
+        world.movement.creeps.push(SimCreep {
+            id: 2,
+            owner: ATTACKER,
+            pos: pos(23, 24),
+            body: SimBody::unboosted(&healer),
+            fatigue: 0,
+            carry_used: 0,
+        });
+        let under = run_siege(
+            world,
+            DEFENDER,
+            core_id,
+            core_pos,
+            &mut |w| sized_squad_intents(w, ATTACKER, core_id, core_pos),
+            300,
+        );
         assert_ne!(
             under.result,
             SiegeResult::CoreBreached,
             "an under-healed squad is worn down before it can breach (size-to-hold is load-bearing); got {under:?}"
         );
-        assert_eq!(under.core_hits, 3000, "the core never took a hit — the under-healed squad never broke through");
+        assert_eq!(
+            under.core_hits, 3000,
+            "the core never took a hit — the under-healed squad never broke through"
+        );
     }
 }

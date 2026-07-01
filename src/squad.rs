@@ -7,13 +7,16 @@
 //! routes the squad's W×H box around walls; a [`AnchorOutcome::Blocked`] anchor surfaces a path
 //! failure for the owner to respond to.
 
-use crate::pathing::{build_combat_matrix, resolve_moves_via_system, SimMoveCache, SimMoveRequest};
+use crate::pathing::{build_combat_matrix, move_request_from_intent, resolve_moves_via_system};
 use crate::{to_engine_action, SimView};
+// The movement request/cache types live in the kernel now (ADR 0033 M1); import them directly.
+use screeps_sim_core::{SimMoveCache, SimMoveRequest};
 use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_decision::{
     cohesion, decide_combat, decide_movement, decide_squad_with_pathing,
     kite::{SquadTacticParams, MAX_KITE_OPS},
-    CombatIntent, CreepOrders, EngageObjective, FocusTarget, SquadMemberView, SquadMovement, SquadOrderState, SquadStateDto, SquadView,
+    CombatIntent, CreepOrders, EngageObjective, FocusTarget, SquadMemberView, SquadMovement,
+    SquadOrderState, SquadStateDto, SquadView,
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
 use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority};
@@ -79,7 +82,10 @@ impl SimSquad {
             min_y = min_y.min(dy);
             max_y = max_y.max(dy);
         }
-        (((max_x - min_x + 1).max(1)) as u8, ((max_y - min_y + 1).max(1)) as u8)
+        (
+            ((max_x - min_x + 1).max(1)) as u8,
+            ((max_y - min_y + 1).max(1)) as u8,
+        )
     }
 
     /// Member positions (living members only), in slot order — for cohesion measurement.
@@ -95,7 +101,14 @@ impl SimSquad {
     fn all_member_positions(&self, world: &CombatWorld) -> Vec<Position> {
         self.members
             .iter()
-            .filter_map(|&id| world.creeps.iter().find(|c| c.id == id && c.is_alive()).map(|c| c.pos))
+            .filter_map(|&id| {
+                world
+                    .movement
+                    .creeps
+                    .iter()
+                    .find(|c| c.id == id && c.is_alive())
+                    .map(|c| c.pos)
+            })
             .collect()
     }
 
@@ -120,15 +133,21 @@ impl SimSquad {
         // works — it clears `self.loose`, transitioning back to a tight box as soon as possible; the
         // members then re-gather into their slots.
         let blob = self.members.len() > 4;
-        let box_rate = cohesion::measure(&positions, Some((anchor_pos, &self.layout)), COHESION_TOL).in_formation_rate;
+        let box_rate =
+            cohesion::measure(&positions, Some((anchor_pos, &self.layout)), COHESION_TOL)
+                .in_formation_rate;
         // Gathered-near-anchor count via the SHARED rally kernel (`members_gathered_at`) — the SAME
         // instrument the live bot's gather quorum uses, so the sim's assault-advance gate and the bot's
         // can't drift (the movement-stall root cause). `LOOSE_RADIUS == rally::RALLY_GATHER_RADIUS` and
         // `ADVANCE_QUORUM == rally::GATHER_QUORUM_RATIO`, so this is byte-equivalent to the prior inline
         // count/ratio — the drain agent-sim test stays unchanged.
         let anchor_opts: Vec<Option<Position>> = positions.iter().map(|p| Some(*p)).collect();
-        let near_anchor =
-            screeps_combat_decision::rally::members_gathered_at(&anchor_opts, anchor_pos, LOOSE_RADIUS) as f32 / n;
+        let near_anchor = screeps_combat_decision::rally::members_gathered_at(
+            &anchor_opts,
+            anchor_pos,
+            LOOSE_RADIUS,
+        ) as f32
+            / n;
 
         // Gate: a strung-out (loose) squad or a blob advances on centroid proximity (so it can keep
         // threading / re-gathering); a formed box advances only when actually in box formation.
@@ -146,14 +165,26 @@ impl SimSquad {
         let mut outcome = AnchorOutcome::Advanced;
         if cohesive {
             if blob {
-                outcome = self.anchor.advance(self.objective, (1, 1), &mut pf, &mut |r| build_combat_matrix(world, r, self.owner));
+                outcome = self
+                    .anchor
+                    .advance(self.objective, (1, 1), &mut pf, &mut |r| {
+                        build_combat_matrix(world, r, self.owner)
+                    });
             } else {
                 // Always attempt to move as a box. Blocked ⇒ a corridor: relax to single-file and
                 // mark loose. Not blocked ⇒ the box fits (open terrain): clear loose to re-form.
-                outcome = self.anchor.advance(self.objective, self.footprint(), &mut pf, &mut |r| build_combat_matrix(world, r, self.owner));
+                outcome =
+                    self.anchor
+                        .advance(self.objective, self.footprint(), &mut pf, &mut |r| {
+                            build_combat_matrix(world, r, self.owner)
+                        });
                 if outcome == AnchorOutcome::Blocked {
                     self.loose = true;
-                    outcome = self.anchor.advance(self.objective, (1, 1), &mut pf, &mut |r| build_combat_matrix(world, r, self.owner));
+                    outcome = self
+                        .anchor
+                        .advance(self.objective, (1, 1), &mut pf, &mut |r| {
+                            build_combat_matrix(world, r, self.owner)
+                        });
                 } else {
                     self.loose = false;
                 }
@@ -164,9 +195,9 @@ impl SimSquad {
         // Move members: box → exact slot; loose (blob / corridor) → clump near the anchor (they
         // queue single-file through a 1-wide corridor). Fight via the seam regardless.
         let anchor = self.anchor.virtual_pos; // post-advance (may have crossed a border)
-        // While crossing/straddling a border, members CONVERGE on the anchor (range 1) instead of
-        // holding box slots: the box slots straddle the boundary (some clamp off-room), so converging
-        // gathers the bloc at the exit (pre-group) and pulls stragglers across after it (bulk-cross).
+                                              // While crossing/straddling a border, members CONVERGE on the anchor (range 1) instead of
+                                              // holding box slots: the box slots straddle the boundary (some clamp off-room), so converging
+                                              // gathers the bloc at the exit (pre-group) and pulls stragglers across after it (bulk-cross).
         let straddling = self
             .all_member_positions(world)
             .iter()
@@ -178,7 +209,12 @@ impl SimSquad {
         let mut move_reqs: Vec<SimMoveRequest> = Vec::new();
         for (slot, &member_id) in self.members.iter().enumerate() {
             // Skip dead/gone members entirely (no combat, no move request).
-            if !world.creeps.iter().any(|c| c.id == member_id && c.is_alive()) {
+            if !world
+                .movement
+                .creeps
+                .iter()
+                .any(|c| c.id == member_id && c.is_alive())
+            {
                 continue;
             }
 
@@ -200,7 +236,10 @@ impl SimSquad {
                 (anchor, 1)
             } else {
                 let offset = self.layout.get(slot).copied().unwrap_or((0, 0));
-                (offset_pos(anchor, offset), if loose || crossing { 1 } else { 0 })
+                (
+                    offset_pos(anchor, offset),
+                    if loose || crossing { 1 } else { 0 },
+                )
             };
             move_reqs.push(SimMoveRequest::move_to(member_id, target, range));
         }
@@ -208,7 +247,9 @@ impl SimSquad {
         // (swaps / shoves / stuck-escalation), the same mover the live bot uses, then apply the
         // resolved directions. The folded slots above give a good (distinct) target geometry; the
         // resolver deconflicts whatever collisions remain — sim ≡ live.
-        for (id, dir) in resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache) {
+        for (id, dir) in
+            resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache)
+        {
             intents.set_move(id, dir);
         }
         (intents, outcome)
@@ -310,16 +351,41 @@ impl ManagedSimSquad {
         // squad whose members are still in another room would be invisible to it (no intents → no
         // movement). Until the whole living squad has crossed into the objective room, path it there via
         // the per-creep rover (which crosses borders); the in-room combat brain runs only once arrived.
-        let living_ids: Vec<CreepId> = self.members.iter().copied().filter(|&id| world.creeps.iter().any(|c| c.id == id && c.is_alive())).collect();
+        let living_ids: Vec<CreepId> = self
+            .members
+            .iter()
+            .copied()
+            .filter(|&id| {
+                world
+                    .movement
+                    .creeps
+                    .iter()
+                    .any(|c| c.id == id && c.is_alive())
+            })
+            .collect();
         if living_ids.is_empty() {
             return Intents::new();
         }
-        let in_objective_room = |id: CreepId| world.creeps.iter().any(|c| c.id == id && c.is_alive() && c.pos.room_name() == room);
+        let in_objective_room = |id: CreepId| {
+            world
+                .movement
+                .creeps
+                .iter()
+                .any(|c| c.id == id && c.is_alive() && c.pos.room_name() == room)
+        };
         if !living_ids.iter().copied().all(in_objective_room) {
             let mut intents = Intents::new();
-            let goal = CombatIntent::MoveTo { target: self.objective, range: 1 };
-            let reqs: Vec<SimMoveRequest> = living_ids.iter().filter_map(|&id| SimMoveRequest::from_intent(id, &goal)).collect();
-            for (id, dir) in resolve_moves_via_system(world, self.owner, &reqs, &mut self.move_cache) {
+            let goal = CombatIntent::MoveTo {
+                target: self.objective,
+                range: 1,
+            };
+            let reqs: Vec<SimMoveRequest> = living_ids
+                .iter()
+                .filter_map(|&id| move_request_from_intent(id, &goal))
+                .collect();
+            for (id, dir) in
+                resolve_moves_via_system(world, self.owner, &reqs, &mut self.move_cache)
+            {
                 intents.set_move(id, dir);
             }
             return intents;
@@ -328,7 +394,11 @@ impl ManagedSimSquad {
         let sim = SimView::from_world(world, self.owner, self.objective, room);
 
         // Living members in slot order — `member_views` and the decision index by THIS list.
-        let living: Vec<(CreepId, usize)> = self.members.iter().filter_map(|&id| sim.friend_index(id).map(|fi| (id, fi))).collect();
+        let living: Vec<(CreepId, usize)> = self
+            .members
+            .iter()
+            .filter_map(|&id| sim.friend_index(id).map(|fi| (id, fi)))
+            .collect();
         if living.is_empty() {
             return Intents::new();
         }
@@ -343,23 +413,34 @@ impl ManagedSimSquad {
                     pos: Some(f.pos),
                     has_ranged: f.has_working(Part::RangedAttack),
                     // Per-tick attack output for the engage DMG reward (ADR 0019 focus_damage richness).
-                    melee_power: f.working_parts(Part::Attack) as u32 * screeps_combat_engine::constants::ATTACK_POWER,
-                    ranged_power: f.working_parts(Part::RangedAttack) as u32 * screeps_combat_engine::constants::RANGED_ATTACK_POWER,
+                    melee_power: f.working_parts(Part::Attack) as u32
+                        * screeps_combat_engine::constants::ATTACK_POWER,
+                    ranged_power: f.working_parts(Part::RangedAttack) as u32
+                        * screeps_combat_engine::constants::RANGED_ATTACK_POWER,
                     damage_taken_last_tick: 0,
                     // ADR 0025: the synthetic id (so the kernel's heal intent resolves this ally) + the
                     // structure-damage/declaim capabilities the kernel's action menu prices.
                     id: f.id,
-                    dismantle_power: f.working_parts(Part::Work) as u32 * screeps_combat_engine::constants::DISMANTLE_POWER,
-                    claim_power: f.working_parts(Part::Claim) as u32 * screeps_combat_engine::constants::CONTROLLER_ATTACK_PER_PART,
+                    dismantle_power: f.working_parts(Part::Work) as u32
+                        * screeps_combat_engine::constants::DISMANTLE_POWER,
+                    claim_power: f.working_parts(Part::Claim) as u32
+                        * screeps_combat_engine::constants::CONTROLLER_ATTACK_PER_PART,
                 }
             })
             .collect();
 
         // Stalemate tracking: total alive ENEMY hits this tick; no decrease for STALL_LIMIT ticks ⇒ a
         // standoff we're not closing → report enemy_stalled (the Destroy disengage; Hold ignores it).
-        let enemy_hits: u32 = sim.hostiles().iter().filter(|h| h.hits > 0).map(|h| h.hits).sum();
+        let enemy_hits: u32 = sim
+            .hostiles()
+            .iter()
+            .filter(|h| h.hits > 0)
+            .map(|h| h.hits)
+            .sum();
         match self.prev_enemy_hits {
-            Some(prev) if enemy_hits >= prev => self.stall_ticks = self.stall_ticks.saturating_add(1),
+            Some(prev) if enemy_hits >= prev => {
+                self.stall_ticks = self.stall_ticks.saturating_add(1)
+            }
             _ => self.stall_ticks = 0,
         }
         self.prev_enemy_hits = Some(enemy_hits);
@@ -377,7 +458,13 @@ impl ManagedSimSquad {
             enemy_stalled,
             drain_stance: self.drain_stance,
         };
-        let decision = decide_squad_with_pathing(&view, None, self.tactics, &mut |r| build_combat_matrix(world, r, self.owner), MAX_KITE_OPS);
+        let decision = decide_squad_with_pathing(
+            &view,
+            None,
+            self.tactics,
+            &mut |r| build_combat_matrix(world, r, self.owner),
+            MAX_KITE_OPS,
+        );
         self.state = decision.state;
 
         let squad_dto = SquadStateDto {
@@ -390,14 +477,26 @@ impl ManagedSimSquad {
         let mut intents = Intents::new();
         let mut move_reqs: Vec<SimMoveRequest> = Vec::new();
         for (idx, &(member_id, fi)) in living.iter().enumerate() {
-            let heal_target = decision.heal_assignments.iter().find(|a| a.healer_idx == idx).and_then(|a| {
-                let &(_, tfi) = living.get(a.target_idx)?;
-                let tf = &sim.friends()[tfi];
-                Some(FocusTarget { pos: tf.pos, id: tf.id })
-            });
+            let heal_target = decision
+                .heal_assignments
+                .iter()
+                .find(|a| a.healer_idx == idx)
+                .and_then(|a| {
+                    let &(_, tfi) = living.get(a.target_idx)?;
+                    let tf = &sim.friends()[tfi];
+                    Some(FocusTarget {
+                        pos: tf.pos,
+                        id: tf.id,
+                    })
+                });
             // Per-member focus with damage spill (ADR 0020 §4.2); `None` ⇒ the shared focus. `idx`
             // aligns with `decision.focus_assignments` (member_views were built from `living` in order).
-            let focus = decision.focus_assignments.get(idx).copied().flatten().or(decision.focus);
+            let focus = decision
+                .focus_assignments
+                .get(idx)
+                .copied()
+                .flatten()
+                .or(decision.focus);
             let orders = CreepOrders { focus, heal_target };
             // ADR 0019 §8 heal-coverage positioning: a pure-support healer gets its OWN tile goal
             // (member_goals) instead of the shared block directive — the live SquadManager applies it the
@@ -416,7 +515,10 @@ impl ManagedSimSquad {
                 Some(ks) if !ks.is_empty() => ks.clone(),
                 _ => decide_combat(&view_i),
             };
-            let actions: Vec<_> = combat_intents.iter().filter_map(|ci| to_engine_action(ci, &sim)).collect();
+            let actions: Vec<_> = combat_intents
+                .iter()
+                .filter_map(|ci| to_engine_action(ci, &sim))
+                .collect();
             if !actions.is_empty() {
                 intents.set(member_id, actions);
             }
@@ -425,7 +527,10 @@ impl ManagedSimSquad {
             // shared resolver mover with everyone else's so the manager squad gets traffic management.
             // Combat creeps take HIGH priority so they win the forward (shooting) tile over support —
             // otherwise the resolver's neutral tie-break can park the shooter one tile out of range.
-            if let Some(mut req) = decide_movement(&view_i).iter().find_map(|mv| SimMoveRequest::from_intent(member_id, mv)) {
+            if let Some(mut req) = decide_movement(&view_i)
+                .iter()
+                .find_map(|mv| move_request_from_intent(member_id, mv))
+            {
                 let f = &sim.friends()[fi];
                 let combat = f.has_working(Part::RangedAttack) || f.working_parts(Part::Attack) > 0;
                 if combat {
@@ -435,7 +540,9 @@ impl ManagedSimSquad {
                 // Anti-scatter anchor: while Engaged + cohesive, confine each member's shoves/swaps to
                 // within the cohesion radius of the centroid so the resolver can't push the block off its
                 // scored tiles (the investigated managed-squad anchoring gap).
-                if matches!(decision.state, SquadOrderState::Engaged) && decision.cohesion_radius > 0 {
+                if matches!(decision.state, SquadOrderState::Engaged)
+                    && decision.cohesion_radius > 0
+                {
                     if let Some(center) = decision.center {
                         req = req.with_anchor(center, decision.cohesion_radius);
                     }
@@ -444,7 +551,9 @@ impl ManagedSimSquad {
             }
         }
         // ONE traffic-managed pass for the whole squad (rover MovementSystem + resolver), like live.
-        for (id, dir) in resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache) {
+        for (id, dir) in
+            resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache)
+        {
             intents.set_move(id, dir);
         }
         intents
@@ -455,13 +564,17 @@ impl ManagedSimSquad {
 mod tests {
     use super::*;
     use screeps::RoomName;
-    use screeps_combat_engine::{resolve_tick, SimBody, SimCreep};
+    use screeps_combat_engine::{resolve_tick, MovementState, SimBody, SimCreep};
 
     fn room() -> RoomName {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
     fn creep(id: CreepId, x: u8, y: u8) -> SimCreep {
         SimCreep {
@@ -471,6 +584,7 @@ mod tests {
             // balanced body so it clears fatigue and moves every tick on plains.
             body: SimBody::unboosted(&[Part::Attack, Part::Move]),
             fatigue: 0,
+            carry_used: 0,
         }
     }
 
@@ -494,30 +608,73 @@ mod tests {
         // west neighbour W2N1. The travel mode must path the managed squad across (the room-scoped view
         // alone can't — the operator-flagged "no cross-room movement").
         let w2: RoomName = "W2N1".parse().unwrap();
-        let p2 = |x: u8, y: u8| Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), w2);
+        let p2 = |x: u8, y: u8| {
+            Position::new(
+                RoomCoordinate::new(x).unwrap(),
+                RoomCoordinate::new(y).unwrap(),
+                w2,
+            )
+        };
         let mut world = CombatWorld {
-            creeps: vec![
-                SimCreep { id: 1, owner: 0, pos: pos(3, 25), body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]), fatigue: 0 },
-                SimCreep { id: 2, owner: 0, pos: pos(3, 26), body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]), fatigue: 0 },
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    SimCreep {
+                        id: 1,
+                        owner: 0,
+                        pos: pos(3, 25),
+                        body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]),
+                        fatigue: 0,
+                        carry_used: 0,
+                    },
+                    SimCreep {
+                        id: 2,
+                        owner: 0,
+                        pos: pos(3, 26),
+                        body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]),
+                        fatigue: 0,
+                        carry_used: 0,
+                    },
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut squad = ManagedSimSquad::new(0, vec![1, 2], p2(40, 25));
         for _ in 0..150 {
             let i = squad.step(&world);
             resolve_tick(&mut world, &i);
-            if world.creeps.iter().all(|c| c.pos.room_name() == w2) {
+            if world
+                .movement
+                .creeps
+                .iter()
+                .all(|c| c.pos.room_name() == w2)
+            {
                 break;
             }
         }
-        assert!(world.creeps.iter().any(|c| c.pos.room_name() == w2), "the managed squad crossed W1N1 → W2N1 (travel mode)");
+        assert!(
+            world
+                .movement
+                .creeps
+                .iter()
+                .any(|c| c.pos.room_name() == w2),
+            "the managed squad crossed W1N1 → W2N1 (travel mode)"
+        );
     }
 
     #[test]
     fn a_quad_crosses_an_open_room_staying_in_formation() {
         // Start a 2×2 quad formed at (5,25), objective (40,25). It should arrive cohesively.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 5, 25), creep(2, 6, 25), creep(3, 5, 26), creep(4, 6, 26)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 5, 25),
+                    creep(2, 6, 25),
+                    creep(3, 5, 26),
+                    creep(4, 6, 26),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut squad = quad_squad(pos(5, 25), pos(40, 25));
@@ -526,15 +683,26 @@ mod tests {
             let (intents, _) = squad.step(&world);
             resolve_tick(&mut world, &intents);
             let sim = SimView::from_world(&world, 0, squad.anchor.virtual_pos, room());
-            let s = cohesion::measure(&squad.member_positions(&sim), Some((squad.anchor.virtual_pos, &QUAD)), 1);
+            let s = cohesion::measure(
+                &squad.member_positions(&sim),
+                Some((squad.anchor.virtual_pos, &QUAD)),
+                1,
+            );
             worst_in_formation = worst_in_formation.min(s.in_formation_rate);
             if squad.anchor.virtual_pos == pos(40, 25) {
                 break;
             }
         }
         // The anchor reached the objective and the squad never fell apart.
-        assert!(squad.anchor.virtual_pos.x().u8() >= 38, "squad advanced to the objective");
-        assert!(worst_in_formation >= 0.75, "stayed cohesive throughout (worst {})", worst_in_formation);
+        assert!(
+            squad.anchor.virtual_pos.x().u8() >= 38,
+            "squad advanced to the objective"
+        );
+        assert!(
+            worst_in_formation >= 0.75,
+            "stayed cohesive throughout (worst {})",
+            worst_in_formation
+        );
     }
 
     #[test]
@@ -544,9 +712,21 @@ mod tests {
         // room and the pairwise spread stays bounded through the crossing (not strung out one-by-one
         // across the border, which is where a scattered squad gets picked off).
         let east = pos(49, 25).checked_add((1, 0)).unwrap().room_name();
-        let objective = Position::new(RoomCoordinate::new(20).unwrap(), RoomCoordinate::new(25).unwrap(), east);
+        let objective = Position::new(
+            RoomCoordinate::new(20).unwrap(),
+            RoomCoordinate::new(25).unwrap(),
+            east,
+        );
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 44, 24), creep(2, 45, 24), creep(3, 44, 25), creep(4, 45, 25)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 44, 24),
+                    creep(2, 45, 24),
+                    creep(3, 44, 25),
+                    creep(4, 45, 25),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut squad = quad_squad(pos(44, 24), objective);
@@ -566,20 +746,35 @@ mod tests {
                 break;
             }
         }
-        assert!(all_in_east, "the whole quad crossed the border into the east room");
-        assert!(worst_spread <= 8, "the quad crossed as a bloc, never strung out (worst spread {})", worst_spread);
+        assert!(
+            all_in_east,
+            "the whole quad crossed the border into the east room"
+        );
+        assert!(
+            worst_spread <= 8,
+            "the quad crossed as a bloc, never strung out (worst spread {})",
+            worst_spread
+        );
     }
 
     #[test]
     fn a_quad_routes_its_footprint_around_a_wall() {
         // A wall band with a 3-wide gap; a 2×2 quad must route through the gap (fits) and not clip.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 5, 25), creep(2, 6, 25), creep(3, 5, 26), creep(4, 6, 26)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 5, 25),
+                    creep(2, 6, 25),
+                    creep(3, 5, 26),
+                    creep(4, 6, 26),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         for y in 0..=49u8 {
             if !(24..=26).contains(&y) {
-                world.terrain.walls.insert((20, y)); // wall column with a gap at y=24..=26
+                world.movement.terrain.walls.insert((20, y)); // wall column with a gap at y=24..=26
             }
         }
         let mut squad = quad_squad(pos(5, 25), pos(35, 25));
@@ -595,7 +790,10 @@ mod tests {
             }
         }
         assert!(!blocked, "the 2×2 fits the 3-wide gap → never Blocked");
-        assert!(squad.anchor.virtual_pos.x().u8() >= 33, "squad threaded the gap to the far side");
+        assert!(
+            squad.anchor.virtual_pos.x().u8() >= 33,
+            "squad threaded the gap to the far side"
+        );
     }
 
     #[test]
@@ -603,12 +801,20 @@ mod tests {
         // A 1-wide gap a 2×2 box can't fit → M3 relaxes to single-file (footprint 1×1, members
         // clump) and threads it, re-forming on the far side.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 5, 25), creep(2, 6, 25), creep(3, 5, 26), creep(4, 6, 26)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 5, 25),
+                    creep(2, 6, 25),
+                    creep(3, 5, 26),
+                    creep(4, 6, 26),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         for y in 0..=49u8 {
             if y != 25 {
-                world.terrain.walls.insert((20, y)); // single-tile gap at y=25
+                world.movement.terrain.walls.insert((20, y)); // single-tile gap at y=25
             }
         }
         let mut squad = quad_squad(pos(15, 25), pos(35, 25));
@@ -619,7 +825,10 @@ mod tests {
                 break;
             }
         }
-        assert!(squad.anchor.virtual_pos.x().u8() >= 33, "relaxed to single-file and threaded the 1-wide corridor");
+        assert!(
+            squad.anchor.virtual_pos.x().u8() >= 33,
+            "relaxed to single-file and threaded the 1-wide corridor"
+        );
     }
 
     #[test]
@@ -627,12 +836,20 @@ mod tests {
         // Thread a 1-wide corridor (forces loose/single-file), then verify the squad transitions
         // back to a TIGHT box as soon as the box footprint can path again on the open far side.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 5, 25), creep(2, 6, 25), creep(3, 5, 26), creep(4, 6, 26)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 5, 25),
+                    creep(2, 6, 25),
+                    creep(3, 5, 26),
+                    creep(4, 6, 26),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         for y in 0..=49u8 {
             if y != 25 {
-                world.terrain.walls.insert((20, y)); // single-tile gap at y=25
+                world.movement.terrain.walls.insert((20, y)); // single-tile gap at y=25
             }
         }
         let mut squad = quad_squad(pos(15, 25), pos(45, 25));
@@ -650,23 +867,49 @@ mod tests {
             let (intents, _) = squad.step(&world);
             resolve_tick(&mut world, &intents);
         }
-        assert!(went_loose, "the squad relaxed to single-file in the corridor");
-        assert!(!squad.loose, "re-formed: back in tight box mode once group pathfinding worked again");
+        assert!(
+            went_loose,
+            "the squad relaxed to single-file in the corridor"
+        );
+        assert!(
+            !squad.loose,
+            "re-formed: back in tight box mode once group pathfinding worked again"
+        );
         let sim = SimView::from_world(&world, 0, squad.anchor.virtual_pos, room());
-        let s = cohesion::measure(&squad.member_positions(&sim), Some((squad.anchor.virtual_pos, &QUAD)), 1);
-        assert!(s.in_formation_rate >= 0.75, "members re-gathered into the box (in-formation {})", s.in_formation_rate);
-        assert!(s.max_pairwise <= 3, "tight again (diameter {})", s.max_pairwise);
+        let s = cohesion::measure(
+            &squad.member_positions(&sim),
+            Some((squad.anchor.virtual_pos, &QUAD)),
+            1,
+        );
+        assert!(
+            s.in_formation_rate >= 0.75,
+            "members re-gathered into the box (in-formation {})",
+            s.in_formation_rate
+        );
+        assert!(
+            s.max_pairwise <= 3,
+            "tight again (diameter {})",
+            s.max_pairwise
+        );
     }
 
     #[test]
     fn reports_blocked_when_fully_sealed() {
         // No gap at all → even the single-file relax fails → Blocked, anchor holds on the near side.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 5, 25), creep(2, 6, 25), creep(3, 5, 26), creep(4, 6, 26)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 5, 25),
+                    creep(2, 6, 25),
+                    creep(3, 5, 26),
+                    creep(4, 6, 26),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         for y in 0..=49u8 {
-            world.terrain.walls.insert((20, y)); // fully sealed
+            world.movement.terrain.walls.insert((20, y)); // fully sealed
         }
         let mut squad = quad_squad(pos(15, 25), pos(35, 25));
         let mut saw_blocked = false;
@@ -675,8 +918,14 @@ mod tests {
             saw_blocked |= outcome == AnchorOutcome::Blocked;
             resolve_tick(&mut world, &intents);
         }
-        assert!(saw_blocked, "fully sealed → Blocked surfaced (even single-file can't pass)");
-        assert!(squad.anchor.virtual_pos.x().u8() < 20, "anchor held on the near side, never clipped through");
+        assert!(
+            saw_blocked,
+            "fully sealed → Blocked surfaced (even single-file can't pass)"
+        );
+        assert!(
+            squad.anchor.virtual_pos.x().u8() < 20,
+            "anchor held on the near side, never clipped through"
+        );
     }
 
     // ── EXP-SQUAD-KITE-1: managed cohesive kiting + focus-fire + survival (P2.G3-tail Step 8) ──
@@ -690,39 +939,127 @@ mod tests {
             .chain(std::iter::repeat_n(Part::Move, 5))
             .chain(std::iter::repeat_n(Part::Tough, 10))
             .collect();
-        let keeper = SimCreep { id: 99, owner: 1, pos: pos(25, 25), body: SimBody::unboosted(&keeper_body), fatigue: 0 };
-        let ra_body = [Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::RangedAttack, Part::Move, Part::Move, Part::Move, Part::Move, Part::Move];
-        let attacker = SimCreep { id: 1, owner: 0, pos: pos(20, 25), body: SimBody::unboosted(&ra_body), fatigue: 0 };
-        let heal_body = [Part::Heal, Part::Heal, Part::Heal, Part::Move, Part::Move, Part::Move];
-        let healer = SimCreep { id: 2, owner: 0, pos: pos(20, 26), body: SimBody::unboosted(&heal_body), fatigue: 0 };
+        let keeper = SimCreep {
+            id: 99,
+            owner: 1,
+            pos: pos(25, 25),
+            body: SimBody::unboosted(&keeper_body),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        let ra_body = [
+            Part::RangedAttack,
+            Part::RangedAttack,
+            Part::RangedAttack,
+            Part::RangedAttack,
+            Part::RangedAttack,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+        ];
+        let attacker = SimCreep {
+            id: 1,
+            owner: 0,
+            pos: pos(20, 25),
+            body: SimBody::unboosted(&ra_body),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        let heal_body = [
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+        ];
+        let healer = SimCreep {
+            id: 2,
+            owner: 0,
+            pos: pos(20, 26),
+            body: SimBody::unboosted(&heal_body),
+            fatigue: 0,
+            carry_used: 0,
+        };
 
-        let mut world = CombatWorld { creeps: vec![keeper, attacker, healer], ..Default::default() };
-        let keeper_hits_0 = world.creeps.iter().find(|c| c.id == 99).unwrap().body.hits;
+        let mut world = CombatWorld {
+            movement: MovementState {
+                creeps: vec![keeper, attacker, healer],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let keeper_hits_0 = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 99)
+            .unwrap()
+            .body
+            .hits;
 
         let mut squad = ManagedSimSquad::new(0, vec![1, 2], pos(25, 25));
         let mut worst_pairwise = 0u32;
         for _ in 0..50 {
             let intents = squad.step(&world);
             resolve_tick(&mut world, &intents);
-            let positions: Vec<Position> = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).map(|c| c.pos).collect();
+            let positions: Vec<Position> = world
+                .movement
+                .creeps
+                .iter()
+                .filter(|c| c.owner == 0 && c.is_alive())
+                .map(|c| c.pos)
+                .collect();
             if positions.len() >= 2 {
-                worst_pairwise = worst_pairwise.max(cohesion::measure(&positions, None, 0).max_pairwise);
+                worst_pairwise =
+                    worst_pairwise.max(cohesion::measure(&positions, None, 0).max_pairwise);
             }
         }
 
-        let keeper_hits_1 = world.creeps.iter().find(|c| c.id == 99).map(|c| if c.is_alive() { c.body.hits } else { 0 }).unwrap_or(0);
-        let duo_alive = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
+        let keeper_hits_1 = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 99)
+            .map(|c| if c.is_alive() { c.body.hits } else { 0 })
+            .unwrap_or(0);
+        let duo_alive = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 0 && c.is_alive())
+            .count();
 
-        assert!(keeper_hits_1 < keeper_hits_0, "the squad focus-fired the keeper ({keeper_hits_0} -> {keeper_hits_1})");
-        assert_eq!(duo_alive, 2, "the duo kited to shooting range + survived (took no melee)");
-        assert!(worst_pairwise <= 4, "the duo stayed cohesive throughout (worst pairwise {worst_pairwise})");
+        assert!(
+            keeper_hits_1 < keeper_hits_0,
+            "the squad focus-fired the keeper ({keeper_hits_0} -> {keeper_hits_1})"
+        );
+        assert_eq!(
+            duo_alive, 2,
+            "the duo kited to shooting range + survived (took no melee)"
+        );
+        assert!(
+            worst_pairwise <= 4,
+            "the duo stayed cohesive throughout (worst pairwise {worst_pairwise})"
+        );
     }
 
     #[test]
     fn a_blob_of_five_advances_loosely() {
         // N>4 → loose-centroid mode: the blob advances to the objective staying near the anchor.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 5, 25), creep(2, 6, 25), creep(3, 5, 26), creep(4, 6, 26), creep(5, 5, 24)],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 5, 25),
+                    creep(2, 6, 25),
+                    creep(3, 5, 26),
+                    creep(4, 6, 26),
+                    creep(5, 5, 24),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut squad = SimSquad {
@@ -741,10 +1078,22 @@ mod tests {
                 break;
             }
         }
-        assert!(squad.anchor.virtual_pos.x().u8() >= 28, "the 5-blob advanced to the objective");
+        assert!(
+            squad.anchor.virtual_pos.x().u8() >= 28,
+            "the 5-blob advanced to the objective"
+        );
         let sim = SimView::from_world(&world, 0, squad.anchor.virtual_pos, room());
-        let near = squad.member_positions(&sim).iter().filter(|p| p.get_range_to(squad.anchor.virtual_pos) <= LOOSE_RADIUS).count();
-        assert!(near >= 4, "blob stayed loosely gathered near the anchor ({} of 5 within {})", near, LOOSE_RADIUS);
+        let near = squad
+            .member_positions(&sim)
+            .iter()
+            .filter(|p| p.get_range_to(squad.anchor.virtual_pos) <= LOOSE_RADIUS)
+            .count();
+        assert!(
+            near >= 4,
+            "blob stayed loosely gathered near the anchor ({} of 5 within {})",
+            near,
+            LOOSE_RADIUS
+        );
     }
 
     #[test]
@@ -760,26 +1109,73 @@ mod tests {
         b.tower(1, 24, 16, 100_000);
         let mut world = b.build();
         let body = [
-            Part::Tough, Part::Tough, Part::Attack, Part::Attack, Part::Attack,
-            Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal, Part::Heal,
-            Part::Move, Part::Move, Part::Move, Part::Move, Part::Move, Part::Move,
+            Part::Tough,
+            Part::Tough,
+            Part::Attack,
+            Part::Attack,
+            Part::Attack,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Heal,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+            Part::Move,
+            Part::Move,
         ];
         for (i, y) in [23u8, 24, 25, 26, 27, 28].into_iter().enumerate() {
-            world.creeps.push(SimCreep { id: 1 + i as u32, owner: 0, pos: pos(20, y), body: SimBody::unboosted(&body), fatigue: 0 });
+            world.movement.creeps.push(SimCreep {
+                id: 1 + i as u32,
+                owner: 0,
+                pos: pos(20, y),
+                body: SimBody::unboosted(&body),
+                fatigue: 0,
+                carry_used: 0,
+            });
         }
-        let hits_0 = world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits;
+        let hits_0 = world
+            .structures
+            .iter()
+            .find(|s| s.id == spawn_id)
+            .unwrap()
+            .hits;
         let mut squad = ManagedSimSquad::new(0, vec![1, 2, 3, 4, 5, 6], pos(25, 25));
         let mut min_range = 99u32;
         for _ in 0..60 {
             let intents = squad.step(&world);
             resolve_tick(&mut world, &intents);
-            for c in world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()) {
+            for c in world
+                .movement
+                .creeps
+                .iter()
+                .filter(|c| c.owner == 0 && c.is_alive())
+            {
                 min_range = min_range.min(c.pos.get_range_to(pos(25, 25)));
             }
         }
-        let hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
-        assert_eq!(min_range, 1, "the melee+heal squad closed to range 1 of the structure");
-        assert!(hits_1 < hits_0, "and dismantled it under tower fire ({hits_0} -> {hits_1})");
+        let hits_1 = world
+            .structures
+            .iter()
+            .find(|s| s.id == spawn_id)
+            .map(|s| s.hits)
+            .unwrap_or(0);
+        assert_eq!(
+            min_range, 1,
+            "the melee+heal squad closed to range 1 of the structure"
+        );
+        assert!(
+            hits_1 < hits_0,
+            "and dismantled it under tower fire ({hits_0} -> {hits_1})"
+        );
     }
 
     #[test]
@@ -822,11 +1218,29 @@ mod tests {
         // Start it already AT the standoff (range ~20 west of the nest) so the proof is the drain + breach,
         // not the approach transient (the approach is the same Drain directive; the standoff move is tested
         // by the decision unit tests).
-        world.creeps.push(SimCreep { id: 1, owner: 0, pos: pos(5, 25), body: SimBody::unboosted(&drain_body), fatigue: 0 });
-        let total_tower_energy = |w: &CombatWorld| w.towers.iter().filter(|t| t.owner == 1).map(|t| t.energy).sum::<u32>();
+        world.movement.creeps.push(SimCreep {
+            id: 1,
+            owner: 0,
+            pos: pos(5, 25),
+            body: SimBody::unboosted(&drain_body),
+            fatigue: 0,
+            carry_used: 0,
+        });
+        let total_tower_energy = |w: &CombatWorld| {
+            w.towers
+                .iter()
+                .filter(|t| t.owner == 1)
+                .map(|t| t.energy)
+                .sum::<u32>()
+        };
         let start_energy = total_tower_energy(&world);
         assert!(start_energy > 0, "the bed has energized finite towers");
-        let core_hits_0 = world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits;
+        let core_hits_0 = world
+            .structures
+            .iter()
+            .find(|s| s.id == spawn_id)
+            .unwrap()
+            .hits;
 
         let mut squad = ManagedSimSquad::new(0, vec![1], pos(25, 25)).with_drain_stance(true);
         let mut towers_dried_at: Option<u32> = None;
@@ -843,30 +1257,63 @@ mod tests {
             }
             // After the drain, track how close the squad gets to the core (the breach advance).
             if towers_dried_at.is_some() {
-                for c in world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()) {
+                for c in world
+                    .movement
+                    .creeps
+                    .iter()
+                    .filter(|c| c.owner == 0 && c.is_alive())
+                {
                     min_range_after_dry = min_range_after_dry.min(c.pos.get_range_to(pos(25, 25)));
                 }
             }
-            if world.creeps.iter().filter(|c| c.owner == 0).all(|c| !c.is_alive()) {
+            if world
+                .movement
+                .creeps
+                .iter()
+                .filter(|c| c.owner == 0)
+                .all(|c| !c.is_alive())
+            {
                 all_dead = true;
                 break;
             }
-            if world.structures.iter().find(|s| s.id == spawn_id).is_none_or(|s| !s.is_alive()) {
+            if world
+                .structures
+                .iter()
+                .find(|s| s.id == spawn_id)
+                .is_none_or(|s| !s.is_alive())
+            {
                 break; // core destroyed
             }
         }
 
-        let survivors = world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()).count();
-        let core_hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
+        let survivors = world
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == 0 && c.is_alive())
+            .count();
+        let core_hits_1 = world
+            .structures
+            .iter()
+            .find(|s| s.id == spawn_id)
+            .map(|s| s.hits)
+            .unwrap_or(0);
 
         assert!(!all_dead, "the drain squad survived the soak (it held the standoff + out-healed the falloff fire)");
         assert!(survivors > 0, "at least one drainer lived to breach");
         // (1)+(2) the finite towers BLED to 0.
-        assert_eq!(total_tower_energy(&world), 0, "the towers bled to 0 energy (start {start_energy})");
+        assert_eq!(
+            total_tower_energy(&world),
+            0,
+            "the towers bled to 0 energy (start {start_energy})"
+        );
         assert!(towers_dried_at.is_some(), "the drain reached dry towers");
         // (3) DRY→ADVANCE: after the drain the squad closed on the dead base and dismantled it.
         assert!(min_range_after_dry <= 3, "after the drain the squad advanced onto the dead base (min range {min_range_after_dry})");
-        assert!(core_hits_1 < core_hits_0, "and dismantled the core ({core_hits_0} -> {core_hits_1})");
+        assert!(
+            core_hits_1 < core_hits_0,
+            "and dismantled the core ({core_hits_0} -> {core_hits_1})"
+        );
     }
 
     #[test]
@@ -881,7 +1328,9 @@ mod tests {
         //        then breaches.
         use crate::opponents::tower_intents;
         use crate::scenario::ScenarioBuilder;
-        use screeps_combat_decision::force_sizing::{assess, AssaultMode, DefenseProfile, ForceBudget, RequiredForce, TowerThreat};
+        use screeps_combat_decision::force_sizing::{
+            assess, AssaultMode, DefenseProfile, ForceBudget, RequiredForce, TowerThreat,
+        };
         use screeps_combat_engine::constants::{DISMANTLE_POWER, HEAL_POWER};
         use screeps_combat_engine::StructureKind;
 
@@ -903,23 +1352,48 @@ mod tests {
                 .towers
                 .iter()
                 .filter(|t| t.owner == 1)
-                .map(|t| TowerThreat { range_to_assault: t.pos.get_range_to(nest), energy: t.energy })
+                .map(|t| TowerThreat {
+                    range_to_assault: t.pos.get_range_to(nest),
+                    energy: t.energy,
+                })
                 .collect(),
             breach_hits: 0,
-            objective_hits: world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits,
+            objective_hits: world
+                .structures
+                .iter()
+                .find(|s| s.id == spawn_id)
+                .unwrap()
+                .hits,
             repair_per_tick: 0.0,
             safe_mode: false,
             ..Default::default()
         };
-        let budget = ForceBudget { max_heal_per_tick: 432.0, max_dismantle_dps: 200.0, tank_effective_hp: 4_400.0, onsite_budget_ticks: 600 };
+        let budget = ForceBudget {
+            max_heal_per_tick: 432.0,
+            max_dismantle_dps: 200.0,
+            tank_effective_hp: 4_400.0,
+            onsite_budget_ticks: 600,
+        };
         // ADR 0031 #41: enemy creep dps is the explicit `assess` arg now (this bed has no defender creeps → 0).
         let assessment = assess(&defense, 0.0, &budget);
-        assert!(assessment.winnable, "the oracle finds the finite-tower bed winnable: {}", assessment.reason);
-        assert_eq!(assessment.mode, AssaultMode::Drain, "and PICKS the drain (breach can't out-heal point-blank): {}", assessment.reason);
+        assert!(
+            assessment.winnable,
+            "the oracle finds the finite-tower bed winnable: {}",
+            assessment.reason
+        );
+        assert_eq!(
+            assessment.mode,
+            AssaultMode::Drain,
+            "and PICKS the drain (breach can't out-heal point-blank): {}",
+            assessment.reason
+        );
 
         // The oracle's SIZED drain comp → part counts. HEAL out-paces the falloff soak; TOUGH is the EHP buffer.
         let required = RequiredForce::from_assessment(&assessment);
-        assert!(required.heal_parts > 0, "the drain comp is sized with HEAL: {required:?}");
+        assert!(
+            required.heal_parts > 0,
+            "the drain comp is sized with HEAL: {required:?}"
+        );
         // The squad fields these parts (+ WORK to breach + MOVE to hold/reposition). One soaking tank proves
         // the tactic; the heal must SOLO out-heal the aggregate falloff, so floor it at the bed's known-good 36.
         let heal_parts = required.heal_parts.max(36);
@@ -933,16 +1407,37 @@ mod tests {
             v
         };
         // Sanity: the fielded heal out-paces the 2×150 = 300/tick falloff floor (the soak the oracle sized for).
-        assert!(heal_parts * HEAL_POWER >= 300, "fielded HEAL out-paces the falloff soak ({heal_parts} parts)");
-        world.creeps.push(SimCreep { id: 1, owner: 0, pos: pos(5, 25), body: SimBody::unboosted(&drain_body), fatigue: 0 });
+        assert!(
+            heal_parts * HEAL_POWER >= 300,
+            "fielded HEAL out-paces the falloff soak ({heal_parts} parts)"
+        );
+        world.movement.creeps.push(SimCreep {
+            id: 1,
+            owner: 0,
+            pos: pos(5, 25),
+            body: SimBody::unboosted(&drain_body),
+            fatigue: 0,
+            carry_used: 0,
+        });
 
         // ── P3: the drain STANCE is DERIVED from the oracle's verdict (exactly the bot's threading), not a literal. ──
         let drain_stance = assessment.mode == AssaultMode::Drain;
         let mut squad = ManagedSimSquad::new(0, vec![1], nest).with_drain_stance(drain_stance);
 
-        let total_tower_energy = |w: &CombatWorld| w.towers.iter().filter(|t| t.owner == 1).map(|t| t.energy).sum::<u32>();
+        let total_tower_energy = |w: &CombatWorld| {
+            w.towers
+                .iter()
+                .filter(|t| t.owner == 1)
+                .map(|t| t.energy)
+                .sum::<u32>()
+        };
         let start_energy = total_tower_energy(&world);
-        let core_hits_0 = world.structures.iter().find(|s| s.id == spawn_id).unwrap().hits;
+        let core_hits_0 = world
+            .structures
+            .iter()
+            .find(|s| s.id == spawn_id)
+            .unwrap()
+            .hits;
         let mut min_range_after_dry = 99u32;
         let mut towers_dried = false;
         for _ in 0..600u32 {
@@ -953,18 +1448,40 @@ mod tests {
                 towers_dried = true;
             }
             if towers_dried {
-                for c in world.creeps.iter().filter(|c| c.owner == 0 && c.is_alive()) {
+                for c in world
+                    .movement
+                    .creeps
+                    .iter()
+                    .filter(|c| c.owner == 0 && c.is_alive())
+                {
                     min_range_after_dry = min_range_after_dry.min(c.pos.get_range_to(nest));
                 }
             }
-            if world.structures.iter().find(|s| s.id == spawn_id).is_none_or(|s| !s.is_alive()) {
+            if world
+                .structures
+                .iter()
+                .find(|s| s.id == spawn_id)
+                .is_none_or(|s| !s.is_alive())
+            {
                 break;
             }
         }
-        let core_hits_1 = world.structures.iter().find(|s| s.id == spawn_id).map(|s| s.hits).unwrap_or(0);
+        let core_hits_1 = world
+            .structures
+            .iter()
+            .find(|s| s.id == spawn_id)
+            .map(|s| s.hits)
+            .unwrap_or(0);
         // The oracle-driven drain bled the finite towers dry, then advanced + dismantled the dead base.
-        assert_eq!(total_tower_energy(&world), 0, "the oracle-sized drain bled the towers to 0 (start {start_energy})");
+        assert_eq!(
+            total_tower_energy(&world),
+            0,
+            "the oracle-sized drain bled the towers to 0 (start {start_energy})"
+        );
         assert!(min_range_after_dry <= 3, "after the drain the squad advanced onto the dead base (min range {min_range_after_dry})");
-        assert!(core_hits_1 < core_hits_0, "and dismantled the core ({core_hits_0} -> {core_hits_1})");
+        assert!(
+            core_hits_1 < core_hits_0,
+            "and dismantled the core ({core_hits_0} -> {core_hits_1})"
+        );
     }
 }

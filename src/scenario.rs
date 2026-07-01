@@ -9,7 +9,9 @@
 
 use crate::opponents::{world_from_units, Unit};
 use screeps::{Position, RoomCoordinate, RoomName};
-use screeps_combat_engine::{CombatWorld, PlayerId, SimStructure, SimTower, StructureId, StructureKind};
+use screeps_combat_engine::{
+    CombatWorld, PlayerId, SimStructure, SimTower, StructureId, StructureKind,
+};
 
 /// Structure ids start high so they never collide with creep ids (creeps start at 1 in `world_from_units`).
 const STRUCT_ID_BASE: StructureId = 1_000_000;
@@ -29,12 +31,26 @@ pub struct ScenarioBuilder {
 
 impl ScenarioBuilder {
     /// Seed the world with two sides' creeps (via [`world_from_units`]), then layer terrain/structures.
-    pub fn from_units(room: RoomName, a_owner: PlayerId, a_units: &[Unit], b_owner: PlayerId, b_units: &[Unit]) -> Self {
-        Self { world: world_from_units(a_owner, a_units, b_owner, b_units), room, next_struct_id: STRUCT_ID_BASE }
+    pub fn from_units(
+        room: RoomName,
+        a_owner: PlayerId,
+        a_units: &[Unit],
+        b_owner: PlayerId,
+        b_units: &[Unit],
+    ) -> Self {
+        Self {
+            world: world_from_units(a_owner, a_units, b_owner, b_units),
+            room,
+            next_struct_id: STRUCT_ID_BASE,
+        }
     }
     /// An empty room to fill from scratch.
     pub fn empty(room: RoomName) -> Self {
-        Self { world: CombatWorld::default(), room, next_struct_id: STRUCT_ID_BASE }
+        Self {
+            world: CombatWorld::default(),
+            room,
+            next_struct_id: STRUCT_ID_BASE,
+        }
     }
 
     /// Switch the builder's **current room** — subsequent terrain / structure / tower calls target
@@ -62,7 +78,10 @@ impl ScenarioBuilder {
     // ── terrain ──
     pub fn wall(mut self, x: u8, y: u8) -> Self {
         let room = self.room;
-        self.world.terrain_mut(room).walls.insert((x.min(ROOM_MAX), y.min(ROOM_MAX)));
+        self.world
+            .terrain_mut(room)
+            .walls
+            .insert((x.min(ROOM_MAX), y.min(ROOM_MAX)));
         self
     }
     /// A full wall column at `x`, with an optional passable gap `(lo..=hi)` in y (a choke/door).
@@ -70,7 +89,10 @@ impl ScenarioBuilder {
         let room = self.room;
         for y in 0..=ROOM_MAX {
             if !gap.is_some_and(|(lo, hi)| y >= lo && y <= hi) {
-                self.world.terrain_mut(room).walls.insert((x.min(ROOM_MAX), y));
+                self.world
+                    .terrain_mut(room)
+                    .walls
+                    .insert((x.min(ROOM_MAX), y));
             }
         }
         self
@@ -79,7 +101,10 @@ impl ScenarioBuilder {
         let room = self.room;
         for x in 0..=ROOM_MAX {
             if !gap.is_some_and(|(lo, hi)| x >= lo && x <= hi) {
-                self.world.terrain_mut(room).walls.insert((x, y.min(ROOM_MAX)));
+                self.world
+                    .terrain_mut(room)
+                    .walls
+                    .insert((x, y.min(ROOM_MAX)));
             }
         }
         self
@@ -95,10 +120,25 @@ impl ScenarioBuilder {
     }
 
     // ── passive structures (attack/dismantle targets; ramparts shield + suppress attack-back) ──
-    pub fn structure(&mut self, kind: StructureKind, owner: Option<PlayerId>, x: u8, y: u8, hits: u32, hits_max: u32) -> StructureId {
+    pub fn structure(
+        &mut self,
+        kind: StructureKind,
+        owner: Option<PlayerId>,
+        x: u8,
+        y: u8,
+        hits: u32,
+        hits_max: u32,
+    ) -> StructureId {
         let id = self.alloc_id();
         let pos = self.pos(x, y);
-        self.world.structures.push(SimStructure { id, kind, owner, pos, hits, hits_max });
+        self.world.structures.push(SimStructure {
+            id,
+            kind,
+            owner,
+            pos,
+            hits,
+            hits_max,
+        });
         id
     }
     pub fn cwall(mut self, x: u8, y: u8, hits: u32) -> Self {
@@ -110,11 +150,26 @@ impl ScenarioBuilder {
         self
     }
     pub fn spawn(mut self, owner: PlayerId, x: u8, y: u8) -> Self {
-        self.structure(StructureKind::Spawn, Some(owner), x, y, SPAWN_HITS, SPAWN_HITS);
+        self.structure(
+            StructureKind::Spawn,
+            Some(owner),
+            x,
+            y,
+            SPAWN_HITS,
+            SPAWN_HITS,
+        );
         self
     }
     /// A constructed-wall ring (the box of a base). `_owner` reserved for a future owned-perimeter.
-    pub fn perimeter(mut self, _owner: PlayerId, x0: u8, y0: u8, x1: u8, y1: u8, wall_hits: u32) -> Self {
+    pub fn perimeter(
+        mut self,
+        _owner: PlayerId,
+        x0: u8,
+        y0: u8,
+        x1: u8,
+        y1: u8,
+        wall_hits: u32,
+    ) -> Self {
         for x in x0..=x1 {
             self = self.cwall(x, y0, wall_hits).cwall(x, y1, wall_hits);
         }
@@ -128,7 +183,14 @@ impl ScenarioBuilder {
     pub fn tower(&mut self, owner: PlayerId, x: u8, y: u8, energy: u32) -> StructureId {
         let id = self.alloc_id();
         let pos = self.pos(x, y);
-        self.world.towers.push(SimTower { id, owner, pos, energy, hits: TOWER_HITS, hits_max: TOWER_HITS });
+        self.world.towers.push(SimTower {
+            id,
+            owner,
+            pos,
+            energy,
+            hits: TOWER_HITS,
+            hits_max: TOWER_HITS,
+        });
         id
     }
     /// A tight tower cluster around `(cx,cy)` — up to 6, bounds-checked (off-room offsets skipped).
@@ -166,13 +228,19 @@ mod tests {
 
     #[test]
     fn wall_column_leaves_a_gap() {
-        let w = ScenarioBuilder::empty(room()).wall_column(25, Some((24, 26))).build();
+        let w = ScenarioBuilder::empty(room())
+            .wall_column(25, Some((24, 26)))
+            .build();
         // Terrain now lives in the room's override (S3 multi-room); read via terrain_for.
         let t = w.terrain_for(room());
         assert!(t.walls.contains(&(25, 10)), "wall above the gap");
         assert!(t.walls.contains(&(25, 40)), "wall below the gap");
         assert!(!t.walls.contains(&(25, 25)), "gap is passable");
-        assert_eq!(t.walls.iter().filter(|(x, _)| *x == 25).count(), 47, "50 tiles minus a 3-wide gap");
+        assert_eq!(
+            t.walls.iter().filter(|(x, _)| *x == 25).count(),
+            47,
+            "50 tiles minus a 3-wide gap"
+        );
     }
 
     #[test]
@@ -182,12 +250,27 @@ mod tests {
             .spawn(1, 25, 25)
             .rampart(1, 25, 24, 1_000_000)
             .build();
-        let spawns = w.structures.iter().filter(|s| s.kind == StructureKind::Spawn).count();
-        let ramparts = w.structures.iter().filter(|s| s.kind == StructureKind::Rampart).count();
-        let walls = w.structures.iter().filter(|s| s.kind == StructureKind::Wall).count();
+        let spawns = w
+            .structures
+            .iter()
+            .filter(|s| s.kind == StructureKind::Spawn)
+            .count();
+        let ramparts = w
+            .structures
+            .iter()
+            .filter(|s| s.kind == StructureKind::Rampart)
+            .count();
+        let walls = w
+            .structures
+            .iter()
+            .filter(|s| s.kind == StructureKind::Wall)
+            .count();
         assert_eq!(spawns, 1);
         assert_eq!(ramparts, 1);
-        assert!(walls > 30, "an 11x11 perimeter ring is ~40 walls (was {walls})");
+        assert!(
+            walls > 30,
+            "an 11x11 perimeter ring is ~40 walls (was {walls})"
+        );
         // ids are unique + above the creep-id band.
         let mut ids: Vec<_> = w.structures.iter().map(|s| s.id).collect();
         ids.sort_unstable();
@@ -199,9 +282,14 @@ mod tests {
     #[test]
     fn tower_nest_at_the_edge_does_not_panic_and_skips_off_room() {
         // Flush in the SE corner: only (49,49),(_,49 right is off),(49,_ down is off),(48,49),(49,48) are in-room.
-        let w = ScenarioBuilder::empty(room()).tower_nest(1, 49, 49, 6, 100).build();
+        let w = ScenarioBuilder::empty(room())
+            .tower_nest(1, 49, 49, 6, 100)
+            .build();
         assert!(!w.towers.is_empty(), "the center + in-room offsets placed");
-        assert!(w.towers.iter().all(|t| t.pos.x().u8() <= 49 && t.pos.y().u8() <= 49));
+        assert!(w
+            .towers
+            .iter()
+            .all(|t| t.pos.x().u8() <= 49 && t.pos.y().u8() <= 49));
         // (0,0)->(49,49) ok; (1,0)->off; (0,1)->off; (-1,0)->(48,49) ok; (0,-1)->(49,48) ok; (1,1)->off ⇒ 3 placed.
         assert_eq!(w.towers.len(), 3);
     }
@@ -211,13 +299,20 @@ mod tests {
         let mut b = ScenarioBuilder::from_units(
             room(),
             0,
-            &[Unit::new(vec![(screeps::Part::RangedAttack, 5)], vec![Position::new(RoomCoordinate::new(10).unwrap(), RoomCoordinate::new(25).unwrap(), room())])],
+            &[Unit::new(
+                vec![(screeps::Part::RangedAttack, 5)],
+                vec![Position::new(
+                    RoomCoordinate::new(10).unwrap(),
+                    RoomCoordinate::new(25).unwrap(),
+                    room(),
+                )],
+            )],
             1,
             &[],
         );
         let tid = b.tower(1, 25, 25, 200);
         let w = b.build();
-        assert_eq!(w.creeps.len(), 1, "the seeded creep survives");
+        assert_eq!(w.movement.creeps.len(), 1, "the seeded creep survives");
         assert_eq!(w.towers.len(), 1);
         assert_eq!(w.towers[0].id, tid);
     }

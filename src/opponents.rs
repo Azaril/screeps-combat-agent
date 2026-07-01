@@ -13,7 +13,8 @@
 use screeps::{Part, Position, RoomName};
 use screeps_combat_decision::{CombatCreepDto, CombatIntent, CombatView, TacticalAgent};
 use screeps_combat_engine::{
-    record_tick, CombatRecording, CombatWorld, CreepId, Intents, PlayerId, SimBody, SimCreep, TowerAction,
+    record_tick, CombatRecording, CombatWorld, CreepId, Intents, MovementState, PlayerId, SimBody,
+    SimCreep, TowerAction,
 };
 
 use crate::{agent_intents, SimView};
@@ -47,9 +48,15 @@ fn self_or_ally_heal(view: &CombatView) -> Option<CombatIntent> {
         return None;
     }
     Some(if target_range <= 1 {
-        CombatIntent::Heal { target: target_pos, id: target_id }
+        CombatIntent::Heal {
+            target: target_pos,
+            id: target_id,
+        }
     } else {
-        CombatIntent::RangedHeal { target: target_pos, id: target_id }
+        CombatIntent::RangedHeal {
+            target: target_pos,
+            id: target_id,
+        }
     })
 }
 
@@ -72,19 +79,41 @@ impl Unit {
 /// across both sides (so the two agents' intents merge cleanly when resolved together). Lets
 /// adversarial tests express arbitrary compositions for our AI and the opponent without
 /// hand-numbering creeps. (Towers/structures: extend the returned world's fields as needed.)
-pub fn world_from_units(a_owner: PlayerId, a_units: &[Unit], b_owner: PlayerId, b_units: &[Unit]) -> CombatWorld {
+pub fn world_from_units(
+    a_owner: PlayerId,
+    a_units: &[Unit],
+    b_owner: PlayerId,
+    b_units: &[Unit],
+) -> CombatWorld {
     let mut creeps = Vec::new();
     let mut next_id: CreepId = 1;
     for (owner, units) in [(a_owner, a_units), (b_owner, b_units)] {
         for unit in units {
-            let body: Vec<Part> = unit.body.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect();
+            let body: Vec<Part> = unit
+                .body
+                .iter()
+                .flat_map(|&(p, n)| std::iter::repeat_n(p, n))
+                .collect();
             for &p in &unit.positions {
-                creeps.push(SimCreep { id: next_id, owner, pos: p, body: SimBody::unboosted(&body), fatigue: 0 });
+                creeps.push(SimCreep {
+                    id: next_id,
+                    owner,
+                    pos: p,
+                    body: SimBody::unboosted(&body),
+                    fatigue: 0,
+                    carry_used: 0,
+                });
                 next_id += 1;
             }
         }
     }
-    CombatWorld { creeps, ..Default::default() }
+    CombatWorld {
+        movement: MovementState {
+            creeps,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// Nearest hostile to `me` by Chebyshev range, if any.
@@ -106,10 +135,16 @@ impl TacticalAgent for RushAgent {
         let r = view.me.pos.get_range_to(t.pos);
         let mut out = Vec::new();
         if r <= 1 && view.me.has_working(Part::Attack) {
-            out.push(CombatIntent::Attack { target: t.pos, id: t.id });
+            out.push(CombatIntent::Attack {
+                target: t.pos,
+                id: t.id,
+            });
         }
         if r > 1 {
-            out.push(CombatIntent::MoveTo { target: t.pos, range: 1 });
+            out.push(CombatIntent::MoveTo {
+                target: t.pos,
+                range: 1,
+            });
         }
         out
     }
@@ -128,12 +163,21 @@ impl TacticalAgent for KiteAgent {
         let r = view.me.pos.get_range_to(t.pos);
         let mut out = Vec::new();
         if r <= 3 && view.me.has_working(Part::RangedAttack) {
-            out.push(CombatIntent::RangedAttack { target: t.pos, id: t.id });
+            out.push(CombatIntent::RangedAttack {
+                target: t.pos,
+                id: t.id,
+            });
         }
         if r < 3 {
-            out.push(CombatIntent::Flee { from: vec![t.pos], range: 3 });
+            out.push(CombatIntent::Flee {
+                from: vec![t.pos],
+                range: 3,
+            });
         } else if r > 3 {
-            out.push(CombatIntent::MoveTo { target: t.pos, range: 3 });
+            out.push(CombatIntent::MoveTo {
+                target: t.pos,
+                range: 3,
+            });
         }
         out
     }
@@ -151,12 +195,23 @@ impl TacticalAgent for TurtleAgent {
         let mut out = Vec::new();
 
         // Offense: hit the lowest-hits hostile within weapon range.
-        if let Some(t) = view.hostiles.iter().filter(|c| me.pos.get_range_to(c.pos) <= 3).min_by_key(|c| c.hits) {
+        if let Some(t) = view
+            .hostiles
+            .iter()
+            .filter(|c| me.pos.get_range_to(c.pos) <= 3)
+            .min_by_key(|c| c.hits)
+        {
             let r = me.pos.get_range_to(t.pos);
             if r <= 1 && me.has_working(Part::Attack) {
-                out.push(CombatIntent::Attack { target: t.pos, id: t.id });
+                out.push(CombatIntent::Attack {
+                    target: t.pos,
+                    id: t.id,
+                });
             } else if r <= 3 && me.has_working(Part::RangedAttack) {
-                out.push(CombatIntent::RangedAttack { target: t.pos, id: t.id });
+                out.push(CombatIntent::RangedAttack {
+                    target: t.pos,
+                    id: t.id,
+                });
             }
         }
 
@@ -188,6 +243,7 @@ impl TacticalAgent for DrainAgent {
 pub fn tower_intents(world: &CombatWorld, intents: &mut Intents) {
     for tower in world.towers.iter().filter(|t| t.is_alive()) {
         let target = world
+            .movement
             .creeps
             .iter()
             .filter(|c| c.is_alive() && c.owner != tower.owner)
@@ -236,18 +292,42 @@ pub fn run_engagement<A: TacticalAgent, B: TacticalAgent>(
     agent_b: &mut B,
     max_ticks: u32,
 ) -> EngagementOutcome {
-    let creeps = |w: &CombatWorld, owner: PlayerId| w.creeps.iter().filter(|c| c.owner == owner).count();
-    let towers = |w: &CombatWorld, owner: PlayerId| w.towers.iter().filter(|t| t.is_alive() && t.owner == owner).count();
+    let creeps = |w: &CombatWorld, owner: PlayerId| {
+        w.movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner)
+            .count()
+    };
+    let towers = |w: &CombatWorld, owner: PlayerId| {
+        w.towers
+            .iter()
+            .filter(|t| t.is_alive() && t.owner == owner)
+            .count()
+    };
     // A side with standing owned structures (a spawn/rampart, not a neutral wall) isn't "gone" — so a
     // breach/dismantle scenario (defender has structures but maybe no creeps) runs until they fall.
-    let structs = |w: &CombatWorld, owner: PlayerId| w.structures.iter().filter(|s| s.is_alive() && s.owner == Some(owner)).count();
-    let gone = |w: &CombatWorld, owner: PlayerId| creeps(w, owner) == 0 && towers(w, owner) == 0 && structs(w, owner) == 0;
+    let structs = |w: &CombatWorld, owner: PlayerId| {
+        w.structures
+            .iter()
+            .filter(|s| s.is_alive() && s.owner == Some(owner))
+            .count()
+    };
+    let gone = |w: &CombatWorld, owner: PlayerId| {
+        creeps(w, owner) == 0 && towers(w, owner) == 0 && structs(w, owner) == 0
+    };
     let mut worst_cohesion_a = 0u32;
     let mut worst_cohesion_b = 0u32;
     let mut ticks = 0;
     let mut recording = CombatRecording::new();
     let worst_pairwise = |w: &CombatWorld, owner: PlayerId| {
-        let p: Vec<Position> = w.creeps.iter().filter(|c| c.owner == owner).map(|c| c.pos).collect();
+        let p: Vec<Position> = w
+            .movement
+            .creeps
+            .iter()
+            .filter(|c| c.owner == owner)
+            .map(|c| c.pos)
+            .collect();
         let mut m = 0u32;
         for i in 0..p.len() {
             for j in (i + 1)..p.len() {
@@ -275,7 +355,11 @@ pub fn run_engagement<A: TacticalAgent, B: TacticalAgent>(
         ticks += 1;
     }
     let tower_energy = |w: &CombatWorld, owner: PlayerId| {
-        w.towers.iter().filter(|t| t.is_alive() && t.owner == owner).map(|t| t.energy).sum()
+        w.towers
+            .iter()
+            .filter(|t| t.is_alive() && t.owner == owner)
+            .map(|t| t.energy)
+            .sum()
     };
     EngagementOutcome {
         side_a_alive: creeps(&world, a_owner),
@@ -325,14 +409,33 @@ mod tests {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
     fn creep(id: CreepId, owner: PlayerId, x: u8, y: u8, parts: &[(Part, usize)]) -> SimCreep {
-        let body: Vec<Part> = parts.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect();
-        SimCreep { id, owner, pos: pos(x, y), body: SimBody::unboosted(&body), fatigue: 0 }
+        let body: Vec<Part> = parts
+            .iter()
+            .flat_map(|&(p, n)| std::iter::repeat_n(p, n))
+            .collect();
+        SimCreep {
+            id,
+            owner,
+            pos: pos(x, y),
+            body: SimBody::unboosted(&body),
+            fatigue: 0,
+            carry_used: 0,
+        }
     }
     /// One `decide` call for the creep at index `me_idx`, viewing the world as `me_owner`.
-    fn decide_one<A: TacticalAgent>(agent: &mut A, world: &CombatWorld, me_owner: PlayerId, me_idx: usize) -> Vec<CombatIntent> {
+    fn decide_one<A: TacticalAgent>(
+        agent: &mut A,
+        world: &CombatWorld,
+        me_owner: PlayerId,
+        me_idx: usize,
+    ) -> Vec<CombatIntent> {
         let sv = SimView::from_world(world, me_owner, pos(25, 25), room());
         agent.decide(&sv.view_for(me_idx))
     }
@@ -343,21 +446,39 @@ mod tests {
     fn rush_agent_closes_then_attacks() {
         // Far: just advance to range 1.
         let far = CombatWorld {
-            creeps: vec![creep(1, 0, 20, 25, &[(Part::Attack, 5), (Part::Move, 5)]), creep(2, 1, 30, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 20, 25, &[(Part::Attack, 5), (Part::Move, 5)]),
+                    creep(2, 1, 30, 25, &[(Part::Move, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(
             decide_one(&mut RushAgent, &far, 0, 0),
-            vec![CombatIntent::MoveTo { target: pos(30, 25), range: 1 }]
+            vec![CombatIntent::MoveTo {
+                target: pos(30, 25),
+                range: 1
+            }]
         );
         // Adjacent: attack (no move).
         let adj = CombatWorld {
-            creeps: vec![creep(1, 0, 24, 25, &[(Part::Attack, 5), (Part::Move, 5)]), creep(2, 1, 25, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 24, 25, &[(Part::Attack, 5), (Part::Move, 5)]),
+                    creep(2, 1, 25, 25, &[(Part::Move, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(
             decide_one(&mut RushAgent, &adj, 0, 0),
-            vec![CombatIntent::Attack { target: pos(25, 25), id: Some(crate::synthetic_id(2)) }]
+            vec![CombatIntent::Attack {
+                target: pos(25, 25),
+                id: Some(crate::synthetic_id(2))
+            }]
         );
     }
 
@@ -365,20 +486,40 @@ mod tests {
     fn kite_agent_holds_range_three() {
         // Too close (range 2): ranged-attack AND flee to 3.
         let close = CombatWorld {
-            creeps: vec![creep(1, 0, 23, 25, &[(Part::RangedAttack, 5), (Part::Move, 5)]), creep(2, 1, 25, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 23, 25, &[(Part::RangedAttack, 5), (Part::Move, 5)]),
+                    creep(2, 1, 25, 25, &[(Part::Move, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let out = decide_one(&mut KiteAgent, &close, 0, 0);
-        assert!(out.contains(&CombatIntent::RangedAttack { target: pos(25, 25), id: Some(crate::synthetic_id(2)) }));
-        assert!(out.iter().any(|i| matches!(i, CombatIntent::Flee { range: 3, .. })));
+        assert!(out.contains(&CombatIntent::RangedAttack {
+            target: pos(25, 25),
+            id: Some(crate::synthetic_id(2))
+        }));
+        assert!(out
+            .iter()
+            .any(|i| matches!(i, CombatIntent::Flee { range: 3, .. })));
         // Too far (range 5): just advance to 3 (no ranged fire).
         let far = CombatWorld {
-            creeps: vec![creep(1, 0, 20, 25, &[(Part::RangedAttack, 5), (Part::Move, 5)]), creep(2, 1, 25, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 20, 25, &[(Part::RangedAttack, 5), (Part::Move, 5)]),
+                    creep(2, 1, 25, 25, &[(Part::Move, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(
             decide_one(&mut KiteAgent, &far, 0, 0),
-            vec![CombatIntent::MoveTo { target: pos(25, 25), range: 3 }]
+            vec![CombatIntent::MoveTo {
+                target: pos(25, 25),
+                range: 3
+            }]
         );
     }
 
@@ -388,13 +529,23 @@ mod tests {
         let mut me = creep(1, 0, 25, 25, &[(Part::RangedAttack, 3), (Part::Heal, 3)]);
         me.body.hits = me.body.hits_max() - 100; // take some damage
         let world = CombatWorld {
-            creeps: vec![me, creep(2, 1, 27, 25, &[(Part::Move, 1)])],
+            movement: MovementState {
+                creeps: vec![me, creep(2, 1, 27, 25, &[(Part::Move, 1)])],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let out = decide_one(&mut TurtleAgent, &world, 0, 0);
-        assert!(out.iter().any(|i| matches!(i, CombatIntent::RangedAttack { .. })));
-        assert!(out.iter().any(|i| matches!(i, CombatIntent::Heal { .. } | CombatIntent::RangedHeal { .. })));
-        assert!(!out.iter().any(|i| matches!(i, CombatIntent::MoveTo { .. } | CombatIntent::Flee { .. })));
+        assert!(out
+            .iter()
+            .any(|i| matches!(i, CombatIntent::RangedAttack { .. })));
+        assert!(out.iter().any(|i| matches!(
+            i,
+            CombatIntent::Heal { .. } | CombatIntent::RangedHeal { .. }
+        )));
+        assert!(!out
+            .iter()
+            .any(|i| matches!(i, CombatIntent::MoveTo { .. } | CombatIntent::Flee { .. })));
     }
 
     // ── Adversarial engagements through the engine (the H4 self-play runner) ──
@@ -404,14 +555,27 @@ mod tests {
         // The bot's real brain (ranged, MOVE parity) vs a scripted melee rusher. The kiter keeps its
         // distance so the bruiser never connects: ibex survives, the rusher takes ranged damage.
         let world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]), // ibex kiter
-                creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]),     // rush bruiser (MOVE parity)
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]), // ibex kiter
+                    creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]), // rush bruiser (MOVE parity)
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let rusher_max = world.creeps[1].body.hits_max();
-        let out = run_engagement(world, room(), 0, pos(30, 25), &mut IbexAgent, 1, pos(27, 25), &mut RushAgent, 30);
+        let rusher_max = world.movement.creeps[1].body.hits_max();
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(30, 25),
+            &mut IbexAgent,
+            1,
+            pos(27, 25),
+            &mut RushAgent,
+            30,
+        );
         assert_eq!(out.side_a_alive, 1, "the ibex kiter survives the rush");
         // (Validated separately that the kiter takes no melee damage; here assert it pressures the
         // rusher — ranged fire chips it even while kiting.)
@@ -423,19 +587,42 @@ mod tests {
         // Three ibex ranged attackers (210 dps) focus the lone turtle (a 5-HEAL self-healer, 60/tick
         // self-heal): aggregate DPS out-paces the heal, so the turtle dies and all three survive.
         let world = CombatWorld {
-            creeps: vec![
-                creep(10, 1, 25, 25, &[(Part::Heal, 5)]), // turtle healer (500 hits, heals 60/t)
-                creep(1, 0, 25, 22, &[(Part::RangedAttack, 7)]),
-                creep(2, 0, 24, 22, &[(Part::RangedAttack, 7)]),
-                creep(3, 0, 26, 22, &[(Part::RangedAttack, 7)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(10, 1, 25, 25, &[(Part::Heal, 5)]), // turtle healer (500 hits, heals 60/t)
+                    creep(1, 0, 25, 22, &[(Part::RangedAttack, 7)]),
+                    creep(2, 0, 24, 22, &[(Part::RangedAttack, 7)]),
+                    creep(3, 0, 26, 22, &[(Part::RangedAttack, 7)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let out = run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 30);
-        assert_eq!(out.side_b_alive, 0, "focus-fire out-DPSes the turtle's heal");
-        assert_eq!(out.side_a_alive, 3, "the attackers take no damage from a pure healer");
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 22),
+            &mut IbexAgent,
+            1,
+            pos(25, 25),
+            &mut TurtleAgent,
+            30,
+        );
+        assert_eq!(
+            out.side_b_alive, 0,
+            "focus-fire out-DPSes the turtle's heal"
+        );
+        assert_eq!(
+            out.side_a_alive, 3,
+            "the attackers take no damage from a pure healer"
+        );
         // Focus-fire stays cohesive (started within 2 of each other; holding range 3 keeps them tight).
-        assert!(out.worst_cohesion_a <= 4, "attackers stayed cohesive (was {})", out.worst_cohesion_a);
+        assert!(
+            out.worst_cohesion_a <= 4,
+            "attackers stayed cohesive (was {})",
+            out.worst_cohesion_a
+        );
     }
 
     #[test]
@@ -445,7 +632,10 @@ mod tests {
         // stall against x=25. Proves the opponent roster inherits the same pathfinding as the bot.
         let mut world = world_from_units(
             0,
-            &[Unit::new(vec![(Part::Attack, 5), (Part::Move, 5)], vec![pos(10, 25)])],
+            &[Unit::new(
+                vec![(Part::Attack, 5), (Part::Move, 5)],
+                vec![pos(10, 25)],
+            )],
             1,
             &[Unit::new(vec![(Part::Move, 1)], vec![pos(40, 25)])], // inert target on the far side
         );
@@ -453,18 +643,23 @@ mod tests {
             if (24..=26).contains(&y) {
                 continue; // 3-wide gap
             }
-            world.terrain.walls.insert((25, y));
+            world.movement.terrain.walls.insert((25, y));
         }
-        let start_x = world.creeps[0].pos.x().u8();
+        let start_x = world.movement.creeps[0].pos.x().u8();
         for _ in 0..45 {
-            if !world.creeps.iter().any(|c| c.owner == 0) {
+            if !world.movement.creeps.iter().any(|c| c.owner == 0) {
                 break;
             }
             let sv = SimView::from_world(&world, 0, pos(10, 25), room());
             let intents = agent_intents(&world, &sv, &mut RushAgent);
             resolve_tick(&mut world, &intents);
         }
-        let rusher = world.creeps.iter().find(|c| c.owner == 0).expect("rusher alive");
+        let rusher = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.owner == 0)
+            .expect("rusher alive");
         assert!(
             rusher.pos.x().u8() > start_x + 15,
             "the rusher pathfound through the gap past the x=25 wall (reached x={})",
@@ -487,9 +682,25 @@ mod tests {
             1,
             &[Unit::new(vec![(Part::Heal, 10)], vec![pos(25, 25)])],
         );
-        let out = run_engagement(world, room(), 0, pos(25, 22), &mut IbexAgent, 1, pos(25, 25), &mut TurtleAgent, 40);
-        assert_eq!(out.side_b_alive, 0, "the quad's 280 dps beats the turtle's 120/tick heal");
-        assert_eq!(out.side_a_alive, 4, "the quad takes no damage from a weaponless healer");
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 22),
+            &mut IbexAgent,
+            1,
+            pos(25, 25),
+            &mut TurtleAgent,
+            40,
+        );
+        assert_eq!(
+            out.side_b_alive, 0,
+            "the quad's 280 dps beats the turtle's 120/tick heal"
+        );
+        assert_eq!(
+            out.side_a_alive, 4,
+            "the quad takes no damage from a weaponless healer"
+        );
     }
 
     #[test]
@@ -499,12 +710,38 @@ mod tests {
         // energy/shot to zero. Exercises the tower scenario (scripted tower controller, side B has a
         // tower + no creeps) + the drain tactic. Mirrors the engine's drain conformance config.
         let world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 1, &[(Part::Heal, 13)])],
-            towers: vec![SimTower { id: 200, owner: 1, pos: pos(25, 22), energy: 100, hits: 3000, hits_max: 3000 }],
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 1, &[(Part::Heal, 13)])],
+                ..Default::default()
+            },
+            towers: vec![SimTower {
+                id: 200,
+                owner: 1,
+                pos: pos(25, 22),
+                energy: 100,
+                hits: 3000,
+                hits_max: 3000,
+            }],
             ..Default::default()
         };
-        let out = run_engagement(world, room(), 0, pos(25, 1), &mut DrainAgent, 1, pos(25, 22), &mut HoldAgent, 15);
-        assert_eq!(out.side_a_alive, 1, "the drain tank out-heals the falloff tower");
-        assert_eq!(out.side_b_tower_energy, 0, "the tower bled all its energy (10/shot) firing at the drainer");
+        let out = run_engagement(
+            world,
+            room(),
+            0,
+            pos(25, 1),
+            &mut DrainAgent,
+            1,
+            pos(25, 22),
+            &mut HoldAgent,
+            15,
+        );
+        assert_eq!(
+            out.side_a_alive, 1,
+            "the drain tank out-heals the falloff tower"
+        );
+        assert_eq!(
+            out.side_b_tower_energy, 0,
+            "the tower bled all its energy (10/shot) firing at the drainer"
+        );
     }
 }

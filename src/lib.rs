@@ -24,8 +24,9 @@ pub mod squad;
 
 use screeps::{Part, Position, RawObjectId, RoomName, StructureType};
 use screeps_combat_decision::{
-    decide_combat, decide_movement, select_focus_target, CombatBodyPart, CombatCreepDto, CombatIntent,
-    CombatStructureDto, CombatView, CreepOrders, FocusTarget, Ownership, SquadMovement, SquadStateDto, TacticalAgent,
+    decide_combat, decide_movement, select_focus_target, CombatBodyPart, CombatCreepDto,
+    CombatIntent, CombatStructureDto, CombatView, CreepOrders, FocusTarget, Ownership,
+    SquadMovement, SquadStateDto, TacticalAgent,
 };
 use screeps_combat_engine::{
     CombatAction, CombatWorld, CreepId, Intents, PlayerId, SimCreep, StructureId, StructureKind,
@@ -35,7 +36,9 @@ use std::collections::HashMap;
 /// Mint a stable, host-constructible `RawObjectId` for a sim creep from its `CreepId`. Sim creeps
 /// have no game object id; this is purely an addressing handle the sim owns (24 hex digits).
 fn synthetic_id(creep: CreepId) -> RawObjectId {
-    format!("{:024x}", creep).parse().expect("a 24-hex string is a valid RawObjectId")
+    format!("{:024x}", creep)
+        .parse()
+        .expect("a 24-hex string is a valid RawObjectId")
 }
 
 fn structure_type(kind: StructureKind) -> StructureType {
@@ -100,12 +103,17 @@ impl SimView {
     /// Build the view from `me_owner`'s perspective: its living creeps are `friends`, all other
     /// living creeps are `hostiles`; structures + towers are classified mine / hostile / neutral.
     /// `room` is the room the (single-room) world models; `center` is the deciding squad's centroid.
-    pub fn from_world(world: &CombatWorld, me_owner: PlayerId, center: Position, room: RoomName) -> Self {
+    pub fn from_world(
+        world: &CombatWorld,
+        me_owner: PlayerId,
+        center: Position,
+        room: RoomName,
+    ) -> Self {
         let mut id_to_creep = HashMap::new();
         let mut friends = Vec::new();
         let mut friend_ids = Vec::new();
         let mut hostiles = Vec::new();
-        for c in world.creeps.iter().filter(|c| c.is_alive()) {
+        for c in world.movement.creeps.iter().filter(|c| c.is_alive()) {
             let raw = synthetic_id(c.id);
             id_to_creep.insert(raw, c.id);
             let dto = creep_dto(c, raw);
@@ -128,7 +136,9 @@ impl SimView {
             _ => 2,
         };
         let mut index_struct = |pos: Position, kind: StructureKind, id: StructureId| {
-            let replace = struct_kind_at.get(&pos).is_none_or(|&prev| prefer(kind) < prefer(prev));
+            let replace = struct_kind_at
+                .get(&pos)
+                .is_none_or(|&prev| prefer(kind) < prefer(prev));
             if replace {
                 pos_to_struct.insert(pos, id);
                 struct_kind_at.insert(pos, kind);
@@ -171,17 +181,24 @@ impl SimView {
             .iter()
             .map(|c| {
                 c.working_parts(Part::Attack) as u32 * screeps_combat_engine::constants::ATTACK_POWER
-                    + c.working_parts(Part::RangedAttack) as u32 * screeps_combat_engine::constants::RANGED_ATTACK_POWER
+                    + c.working_parts(Part::RangedAttack) as u32
+                        * screeps_combat_engine::constants::RANGED_ATTACK_POWER
             })
             .sum();
-        let focus = select_focus_target(&hostiles, &structures, our_dps, center).filter(|f| f.id.is_some());
+        let focus =
+            select_focus_target(&hostiles, &structures, our_dps, center).filter(|f| f.id.is_some());
 
         Self {
-            tick: world.tick,
+            tick: world.movement.tick,
             me_owner,
             // No squad directive in the per-creep SimView (cohesion_radius 0 → the fallback path);
             // the real squad goal is stamped by `SimSquad` in P2.G3-tail Step 8.
-            squad: SquadStateDto { center, room, movement: SquadMovement::Hold, cohesion_radius: 0 },
+            squad: SquadStateDto {
+                center,
+                room,
+                movement: SquadMovement::Hold,
+                cohesion_radius: 0,
+            },
             friends,
             friend_ids,
             hostiles,
@@ -218,7 +235,10 @@ impl SimView {
             tick: self.tick,
             me: &self.friends[i],
             squad: &self.squad,
-            orders: Some(CreepOrders { focus: self.focus, heal_target: None }),
+            orders: Some(CreepOrders {
+                focus: self.focus,
+                heal_target: None,
+            }),
             friends: &self.friends,
             hostiles: &self.hostiles,
             structures: &self.structures,
@@ -239,7 +259,12 @@ impl SimView {
     /// orders — the **managed-squad** path (P2.G3-tail Step 8): the squad layer
     /// (`decide_squad_with_pathing`) computes the shared movement goal + heal assignment, the sim
     /// stamps them here, and the per-creep `decide_combat`/`decide_movement` consume them.
-    pub fn view_for_with<'a>(&'a self, i: usize, squad: &'a SquadStateDto, orders: CreepOrders) -> CombatView<'a> {
+    pub fn view_for_with<'a>(
+        &'a self,
+        i: usize,
+        squad: &'a SquadStateDto,
+        orders: CreepOrders,
+    ) -> CombatView<'a> {
         CombatView {
             tick: self.tick,
             me: &self.friends[i],
@@ -271,16 +296,26 @@ impl SimView {
 /// `None` for movement intents and for a structure-targeted intent whose position holds no structure.
 pub fn to_engine_action(intent: &CombatIntent, view: &SimView) -> Option<CombatAction> {
     match intent {
-        CombatIntent::Attack { id: Some(raw), .. } => view.creep_for(*raw).map(CombatAction::Attack),
-        CombatIntent::Attack { id: None, target } => view.structure_for(*target).map(CombatAction::AttackStructure),
-        CombatIntent::RangedAttack { id: Some(raw), .. } => view.creep_for(*raw).map(CombatAction::RangedAttack),
-        CombatIntent::RangedAttack { id: None, target } => {
-            view.structure_for(*target).map(CombatAction::RangedAttackStructure)
+        CombatIntent::Attack { id: Some(raw), .. } => {
+            view.creep_for(*raw).map(CombatAction::Attack)
         }
-        CombatIntent::Dismantle { target, .. } => view.structure_for(*target).map(CombatAction::Dismantle),
+        CombatIntent::Attack { id: None, target } => view
+            .structure_for(*target)
+            .map(CombatAction::AttackStructure),
+        CombatIntent::RangedAttack { id: Some(raw), .. } => {
+            view.creep_for(*raw).map(CombatAction::RangedAttack)
+        }
+        CombatIntent::RangedAttack { id: None, target } => view
+            .structure_for(*target)
+            .map(CombatAction::RangedAttackStructure),
+        CombatIntent::Dismantle { target, .. } => {
+            view.structure_for(*target).map(CombatAction::Dismantle)
+        }
         CombatIntent::RangedMassAttack => Some(CombatAction::RangedMassAttack),
         CombatIntent::Heal { id: Some(raw), .. } => view.creep_for(*raw).map(CombatAction::Heal),
-        CombatIntent::RangedHeal { id: Some(raw), .. } => view.creep_for(*raw).map(CombatAction::RangedHeal),
+        CombatIntent::RangedHeal { id: Some(raw), .. } => {
+            view.creep_for(*raw).map(CombatAction::RangedHeal)
+        }
         _ => None,
     }
 }
@@ -305,7 +340,11 @@ impl TacticalAgent for IbexAgent {
 /// ([`to_engine_action`]), movement intents → a step [`screeps::Direction`] planned through rover
 /// ([`pathing::resolve_move_direction`]) and applied via `set_move`. This is the sim's per-tick
 /// step: hand the result to `resolve_tick` (the engine — the authoritative "server").
-pub fn agent_intents<A: TacticalAgent>(world: &CombatWorld, sim: &SimView, agent: &mut A) -> Intents {
+pub fn agent_intents<A: TacticalAgent>(
+    world: &CombatWorld,
+    sim: &SimView,
+    agent: &mut A,
+) -> Intents {
     let mut intents = Intents::new();
     for i in 0..sim.friends().len() {
         let view = sim.view_for(i);
@@ -315,7 +354,9 @@ pub fn agent_intents<A: TacticalAgent>(world: &CombatWorld, sim: &SimView, agent
         for intent in agent.decide(&view) {
             if let Some(action) = to_engine_action(&intent, sim) {
                 actions.push(action);
-            } else if let Some(dir) = pathing::resolve_move_direction(world, me_pos, sim.me_owner(), &intent) {
+            } else if let Some(dir) =
+                pathing::resolve_move_direction(world, me_pos, sim.me_owner(), &intent)
+            {
                 intents.set_move(creep_id, dir);
             }
         }
@@ -341,17 +382,31 @@ impl TacticalAgent for HoldAgent {
 mod tests {
     use super::*;
     use screeps::{Part, RoomCoordinate};
-    use screeps_combat_engine::{resolve_tick, SimBody};
+    use screeps_combat_engine::{resolve_tick, MovementState, SimBody};
 
     fn room() -> RoomName {
         "W1N1".parse().unwrap()
     }
     fn pos(x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room())
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room(),
+        )
     }
     fn creep(id: CreepId, owner: PlayerId, x: u8, y: u8, parts: &[(Part, usize)]) -> SimCreep {
-        let body: Vec<Part> = parts.iter().flat_map(|&(p, n)| std::iter::repeat_n(p, n)).collect();
-        SimCreep { id, owner, pos: pos(x, y), body: SimBody::unboosted(&body), fatigue: 0 }
+        let body: Vec<Part> = parts
+            .iter()
+            .flat_map(|&(p, n)| std::iter::repeat_n(p, n))
+            .collect();
+        SimCreep {
+            id,
+            owner,
+            pos: pos(x, y),
+            body: SimBody::unboosted(&body),
+            fatigue: 0,
+            carry_used: 0,
+        }
     }
 
     /// Run `IbexAgent` for every friendly creep and collect the engine intents (combat + movement).
@@ -365,18 +420,27 @@ mod tests {
         // The bot's real decision, over the sim: a ranged attacker focus-fires the hostile healer
         // (the squad focus) even though a non-healer is weaker.
         let world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 24, 25, &[(Part::RangedAttack, 7)]), // me
-                creep(2, 1, 23, 25, &[(Part::Move, 1)]),         // hostile weakling (low hits)
-                creep(3, 1, 26, 25, &[(Part::Heal, 5)]),         // hostile healer
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 24, 25, &[(Part::RangedAttack, 7)]), // me
+                    creep(2, 1, 23, 25, &[(Part::Move, 1)]),         // hostile weakling (low hits)
+                    creep(3, 1, 26, 25, &[(Part::Heal, 5)]),         // hostile healer
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let sv = SimView::from_world(&world, 0, pos(25, 25), room());
         let intents = decide_combat(&sv.view_for(0));
         // Healer (creep 3) is within range 3 → RangedAttack it, not the weaker non-focus.
         let raw = synthetic_id(3);
-        assert_eq!(intents, vec![CombatIntent::RangedAttack { target: pos(26, 25), id: Some(raw) }]);
+        assert_eq!(
+            intents,
+            vec![CombatIntent::RangedAttack {
+                target: pos(26, 25),
+                id: Some(raw)
+            }]
+        );
     }
 
     #[test]
@@ -384,12 +448,15 @@ mod tests {
         // End-to-end: 3 ranged attackers (owner 0) whose REAL decision picks the hostile healer;
         // fed to the engine resolver, they kill it (no self-heal — the healer takes no action).
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(10, 1, 25, 25, &[(Part::Heal, 5)]), // 500-hit hostile healer
-                creep(1, 0, 24, 25, &[(Part::RangedAttack, 7)]),
-                creep(2, 0, 26, 25, &[(Part::RangedAttack, 7)]),
-                creep(3, 0, 25, 24, &[(Part::RangedAttack, 7)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(10, 1, 25, 25, &[(Part::Heal, 5)]), // 500-hit hostile healer
+                    creep(1, 0, 24, 25, &[(Part::RangedAttack, 7)]),
+                    creep(2, 0, 26, 25, &[(Part::RangedAttack, 7)]),
+                    creep(3, 0, 25, 24, &[(Part::RangedAttack, 7)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut died = false;
@@ -400,7 +467,10 @@ mod tests {
                 break;
             }
         }
-        assert!(died, "the bot's focus-fire kills the healer (210 dps vs 500 hits → 3 ticks)");
+        assert!(
+            died,
+            "the bot's focus-fire kills the healer (210 dps vs 500 hits → 3 ticks)"
+        );
     }
 
     #[test]
@@ -410,14 +480,17 @@ mod tests {
         // decide_movement keeps the kiter out of melee range, so it takes 0 damage (melee never
         // connects; ranged fire has no attack-back) while chipping the chaser.
         let mut world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]), // kiter
-                creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]),     // melee chaser, range 3
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 30, 25, &[(Part::RangedAttack, 7), (Part::Move, 7)]), // kiter
+                    creep(2, 1, 27, 25, &[(Part::Attack, 10), (Part::Move, 10)]), // melee chaser, range 3
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
-        let kiter_max = world.creeps[0].body.hits_max();
-        let chaser_max = world.creeps[1].body.hits_max();
+        let kiter_max = world.movement.creeps[0].body.hits_max();
+        let chaser_max = world.movement.creeps[1].body.hits_max();
         for _ in 0..10 {
             // Self-play: both sides decide via IbexAgent; merge (disjoint creep ids) and resolve.
             let sv0 = SimView::from_world(&world, 0, pos(30, 25), room());
@@ -428,27 +501,52 @@ mod tests {
             intents.moves.extend(i1.moves);
             resolve_tick(&mut world, &intents);
         }
-        let kiter = world.creeps.iter().find(|c| c.id == 1).expect("kiter survives");
-        let chaser = world.creeps.iter().find(|c| c.id == 2).expect("chaser still up");
-        assert_eq!(kiter.body.hits, kiter_max, "kiter never let the melee chaser connect → 0 damage");
-        assert!(chaser.body.hits < chaser_max, "kiter chipped the chaser with ranged fire");
-        assert!(kiter.pos.get_range_to(chaser.pos) >= 2, "stayed out of melee range");
+        let kiter = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("kiter survives");
+        let chaser = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == 2)
+            .expect("chaser still up");
+        assert_eq!(
+            kiter.body.hits, kiter_max,
+            "kiter never let the melee chaser connect → 0 damage"
+        );
+        assert!(
+            chaser.body.hits < chaser_max,
+            "kiter chipped the chaser with ranged fire"
+        );
+        assert!(
+            kiter.pos.get_range_to(chaser.pos) >= 2,
+            "stayed out of melee range"
+        );
     }
 
     #[test]
     fn ibex_agent_mass_attacks_when_surrounded() {
         // One ranged creep with 3 hostiles adjacent → RMA (the stacked case), not single-target.
         let world = CombatWorld {
-            creeps: vec![
-                creep(1, 0, 25, 25, &[(Part::RangedAttack, 7)]),
-                creep(2, 1, 24, 25, &[(Part::Move, 1)]),
-                creep(3, 1, 26, 25, &[(Part::Move, 1)]),
-                creep(4, 1, 25, 24, &[(Part::Move, 1)]),
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::RangedAttack, 7)]),
+                    creep(2, 1, 24, 25, &[(Part::Move, 1)]),
+                    creep(3, 1, 26, 25, &[(Part::Move, 1)]),
+                    creep(4, 1, 25, 24, &[(Part::Move, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let sv = SimView::from_world(&world, 0, pos(25, 25), room());
-        assert_eq!(decide_combat(&sv.view_for(0)), vec![CombatIntent::RangedMassAttack]);
+        assert_eq!(
+            decide_combat(&sv.view_for(0)),
+            vec![CombatIntent::RangedMassAttack]
+        );
     }
 
     #[test]
@@ -457,21 +555,37 @@ mod tests {
         let mut wounded = creep(2, 0, 25, 26, &[(Part::Move, 5)]);
         wounded.body.hits = 100; // damaged (max 500)
         let world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Heal, 5)]), wounded, creep(9, 1, 40, 40, &[(Part::Attack, 1)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Heal, 5)]),
+                    wounded,
+                    creep(9, 1, 40, 40, &[(Part::Attack, 1)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let sv = SimView::from_world(&world, 0, pos(25, 25), room());
         // friend index of the healer (creep 1) is 0.
         assert_eq!(
             decide_combat(&sv.view_for(0)),
-            vec![CombatIntent::Heal { target: pos(25, 26), id: Some(synthetic_id(2)) }]
+            vec![CombatIntent::Heal {
+                target: pos(25, 26),
+                id: Some(synthetic_id(2))
+            }]
         );
     }
 
     #[test]
     fn hold_agent_always_idles() {
         let world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Heal, 5)]), creep(2, 1, 30, 30, &[(Part::Heal, 5)])],
+            movement: MovementState {
+                creeps: vec![
+                    creep(1, 0, 25, 25, &[(Part::Heal, 5)]),
+                    creep(2, 1, 30, 30, &[(Part::Heal, 5)]),
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let sv = SimView::from_world(&world, 0, pos(25, 25), room());
@@ -499,19 +613,46 @@ mod tests {
         let sv = SimView::from_world(&world, 0, pos(24, 25), room());
         let t = pos(25, 25);
         assert_eq!(
-            to_engine_action(&CombatIntent::Attack { target: t, id: None }, &sv),
+            to_engine_action(
+                &CombatIntent::Attack {
+                    target: t,
+                    id: None
+                },
+                &sv
+            ),
             Some(CombatAction::AttackStructure(5_000_000))
         );
         assert_eq!(
-            to_engine_action(&CombatIntent::RangedAttack { target: t, id: None }, &sv),
+            to_engine_action(
+                &CombatIntent::RangedAttack {
+                    target: t,
+                    id: None
+                },
+                &sv
+            ),
             Some(CombatAction::RangedAttackStructure(5_000_000))
         );
         assert_eq!(
-            to_engine_action(&CombatIntent::Dismantle { target: t, id: None }, &sv),
+            to_engine_action(
+                &CombatIntent::Dismantle {
+                    target: t,
+                    id: None
+                },
+                &sv
+            ),
             Some(CombatAction::Dismantle(5_000_000))
         );
         // No structure at an empty tile → None (so a stray structure intent is dropped, not misrouted).
-        assert_eq!(to_engine_action(&CombatIntent::Attack { target: pos(10, 10), id: None }, &sv), None);
+        assert_eq!(
+            to_engine_action(
+                &CombatIntent::Attack {
+                    target: pos(10, 10),
+                    id: None
+                },
+                &sv
+            ),
+            None
+        );
     }
 
     #[test]
@@ -522,13 +663,31 @@ mod tests {
         // so the apply layer breaks the shield before the structure it covers).
         let world = CombatWorld {
             structures: vec![
-                SimStructure { id: 5, kind: StructureKind::Spawn, owner: Some(1), pos: pos(25, 25), hits: 5000, hits_max: 5000 },
-                SimStructure { id: 7, kind: StructureKind::Rampart, owner: Some(1), pos: pos(25, 25), hits: 100_000, hits_max: 100_000 },
+                SimStructure {
+                    id: 5,
+                    kind: StructureKind::Spawn,
+                    owner: Some(1),
+                    pos: pos(25, 25),
+                    hits: 5000,
+                    hits_max: 5000,
+                },
+                SimStructure {
+                    id: 7,
+                    kind: StructureKind::Rampart,
+                    owner: Some(1),
+                    pos: pos(25, 25),
+                    hits: 100_000,
+                    hits_max: 100_000,
+                },
             ],
             ..Default::default()
         };
         let sv = SimView::from_world(&world, 0, pos(24, 25), room());
-        assert_eq!(sv.structure_for(pos(25, 25)), Some(7), "the rampart, not the shielded spawn");
+        assert_eq!(
+            sv.structure_for(pos(25, 25)),
+            Some(7),
+            "the rampart, not the shielded spawn"
+        );
     }
 
     // ── U4: tower intents keyed by stable StructureId ──
@@ -539,16 +698,39 @@ mod tests {
         // Two towers (ids 11, 22). Destroy the first in the world (retain drops it, shifting indices),
         // then a set_tower keyed by id 22 must still fire — index-keying would have gone stale.
         let mut world = CombatWorld {
-            creeps: vec![creep(1, 0, 25, 25, &[(Part::Move, 1)])], // a target for the surviving tower
+            movement: MovementState {
+                creeps: vec![creep(1, 0, 25, 25, &[(Part::Move, 1)])],
+                ..Default::default()
+            }, // a target for the surviving tower
             towers: vec![
-                SimTower { id: 11, owner: 1, pos: pos(10, 10), energy: 0, hits: 0, hits_max: 3000 }, // dead → retained out
-                SimTower { id: 22, owner: 1, pos: pos(25, 26), energy: 1000, hits: 3000, hits_max: 3000 },
+                SimTower {
+                    id: 11,
+                    owner: 1,
+                    pos: pos(10, 10),
+                    energy: 0,
+                    hits: 0,
+                    hits_max: 3000,
+                }, // dead → retained out
+                SimTower {
+                    id: 22,
+                    owner: 1,
+                    pos: pos(25, 26),
+                    energy: 1000,
+                    hits: 3000,
+                    hits_max: 3000,
+                },
             ],
             ..Default::default()
         };
         let mut intents = Intents::new();
         intents.set_tower(22, TowerAction::Attack(1)); // keyed by id, not the (now-shifted) index
         let report = resolve_tick(&mut world, &intents);
-        assert!(report.outcomes.get(&1).is_some_and(|o| o.effective_damage > 0), "tower 22 still fired by id");
+        assert!(
+            report
+                .outcomes
+                .get(&1)
+                .is_some_and(|o| o.effective_damage > 0),
+            "tower 22 still fired by id"
+        );
     }
 }

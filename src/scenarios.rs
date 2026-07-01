@@ -17,14 +17,19 @@ mod tests {
     use screeps::{Direction, Part, Position, RoomCoordinate, RoomName};
     use screeps_combat_decision::CombatIntent;
     use screeps_combat_engine::{
-        resolve_tick, CombatWorld, Intents, PlayerId, SimBody, SimCreep, StructureKind,
+        resolve_tick, CombatWorld, Intents, MovementState, PlayerId, SimBody, SimCreep,
+        StructureKind,
     };
 
     const ATTACKER: PlayerId = 0;
     const DEFENDER: PlayerId = 1;
 
     fn at(room: RoomName, x: u8, y: u8) -> Position {
-        Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            room,
+        )
     }
     fn w1n1() -> RoomName {
         "W1N1".parse().unwrap()
@@ -38,7 +43,14 @@ mod tests {
         room
     }
     fn mover(id: u32, owner: PlayerId, pos: Position, parts: &[Part]) -> SimCreep {
-        SimCreep { id, owner, pos, body: SimBody::unboosted(parts), fatigue: 0 }
+        SimCreep {
+            id,
+            owner,
+            pos,
+            body: SimBody::unboosted(parts),
+            fatigue: 0,
+            carry_used: 0,
+        }
     }
 
     // ── CROSS-ROOM-TRAVEL ─────────────────────────────────────────────────────────────────────────
@@ -51,23 +63,34 @@ mod tests {
         let dest_room = east_of_w1n1(2);
         let target = at(dest_room, 10, 25);
         let mut world = CombatWorld {
-            creeps: vec![mover(1, ATTACKER, at(w1n1(), 40, 25), &[Part::Move])],
+            movement: MovementState {
+                creeps: vec![mover(1, ATTACKER, at(w1n1(), 40, 25), &[Part::Move])],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut arrived = None;
         for tick in 0..120 {
-            let from = world.creeps[0].pos;
+            let from = world.movement.creeps[0].pos;
             if from == target {
                 arrived = Some(tick);
                 break;
             }
             let mut i = Intents::new();
-            if let Some(dir) = resolve_move_direction(&world, from, ATTACKER, &CombatIntent::MoveTo { target, range: 0 }) {
+            if let Some(dir) = resolve_move_direction(
+                &world,
+                from,
+                ATTACKER,
+                &CombatIntent::MoveTo { target, range: 0 },
+            ) {
                 i.set_move(1, dir);
             }
             resolve_tick(&mut world, &i);
         }
-        assert!(arrived.is_some(), "creep crossed two borders and reached the target two rooms east");
+        assert!(
+            arrived.is_some(),
+            "creep crossed two borders and reached the target two rooms east"
+        );
     }
 
     // ── FLEE-ACROSS-ROOMS ─────────────────────────────────────────────────────────────────────────
@@ -81,22 +104,39 @@ mod tests {
         // → it heads west to the edge (away from the threat), then the edge-exit carries it across.
         let threat = at(w1n1(), 45, 25);
         let mut world = CombatWorld {
-            creeps: vec![
-                mover(1, ATTACKER, at(w1n1(), 5, 25), &[Part::Move]),
-                mover(99, DEFENDER, threat, &[Part::Attack, Part::Move]), // a stationary menace
-            ],
+            movement: MovementState {
+                creeps: vec![
+                    mover(1, ATTACKER, at(w1n1(), 5, 25), &[Part::Move]),
+                    mover(99, DEFENDER, threat, &[Part::Attack, Part::Move]), // a stationary menace
+                ],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut escaped_room = None;
         for _ in 0..40 {
-            let from = world.creeps.iter().find(|c| c.id == 1).unwrap().pos;
+            let from = world
+                .movement
+                .creeps
+                .iter()
+                .find(|c| c.id == 1)
+                .unwrap()
+                .pos;
             if from.room_name() != w1n1() {
                 escaped_room = Some(from.room_name());
                 break;
             }
             let mut i = Intents::new();
             // Large flee range: no in-room tile escapes it, so the creep flees to the far (west) edge.
-            if let Some(dir) = resolve_move_direction(&world, from, ATTACKER, &CombatIntent::Flee { from: vec![threat], range: 50 }) {
+            if let Some(dir) = resolve_move_direction(
+                &world,
+                from,
+                ATTACKER,
+                &CombatIntent::Flee {
+                    from: vec![threat],
+                    range: 50,
+                },
+            ) {
                 i.set_move(1, dir);
             }
             // The threat holds position; only the fleeing creep moves.
@@ -132,7 +172,10 @@ mod tests {
         let mut body = vec![Part::Tough; 15];
         body.extend(std::iter::repeat_n(Part::Work, 25));
         body.extend(std::iter::repeat_n(Part::Move, 10));
-        world.creeps.push(mover(1, ATTACKER, at(east, 1, 25), &body));
+        world
+            .movement
+            .creeps
+            .push(mover(1, ATTACKER, at(east, 1, 25), &body));
 
         let core_pos = at(bed_room, 46, 25);
         let outcome = run_siege(
@@ -163,6 +206,9 @@ mod tests {
     fn integration_gate_marker() {
         // Sanity that the helper wiring is sound (the real assertions are the scenarios above).
         assert_ne!(east_of_w1n1(1), w1n1());
-        assert_eq!(at(w1n1(), 5, 25).get_direction_to(at(w1n1(), 6, 25)), Some(Direction::Right));
+        assert_eq!(
+            at(w1n1(), 5, 25).get_direction_to(at(w1n1(), 6, 25)),
+            Some(Direction::Right)
+        );
     }
 }
