@@ -18,7 +18,7 @@ use screeps_rover::{
 };
 // The rover DRIVER (resolve_moves_via_system + its request/cache/handle/external types) now lives in
 // the kernel (`screeps-sim-core`, ADR 0033 M1); this crate wraps it with the combat cost source below.
-use screeps_sim_core::{SimMoveCache, SimMoveGoal, SimMoveRequest};
+use screeps_sim_core::{MoverConfig, SimMoveCache, SimMoveGoal, SimMoveRequest};
 use std::collections::{HashMap, HashSet};
 
 /// Search budget — the room is 2500 tiles; this comfortably covers a single-room plan.
@@ -466,11 +466,28 @@ pub fn resolve_moves_via_system(
     requests: &[SimMoveRequest],
     cache: &mut SimMoveCache,
 ) -> HashMap<CreepId, Direction> {
-    screeps_sim_core::resolve_moves_via_system(
+    resolve_moves_via_system_with(world, owner, requests, cache, &MoverConfig::default())
+}
+
+/// [`resolve_moves_via_system`] with explicit rover tunables — the combat analogue of the kernel's
+/// [`screeps_sim_core::resolve_moves_via_system_with`] (ADR 0033 M5), so a COMBAT-corpus parameter
+/// tournament can sweep one [`MoverConfig`] per evaluated point over real combat scenarios (the
+/// rover-eval `tuning.rs` idiom, adjudicating haul-tuned candidates like `ladder(8)` on combat
+/// outcomes). Same cost source, same `MovementState`; `MoverConfig::default()` ⇒ byte-identical to
+/// the plain fn (`Default` mirrors the live tuning exactly, rover_driver.rs).
+pub fn resolve_moves_via_system_with(
+    world: &CombatWorld,
+    owner: PlayerId,
+    requests: &[SimMoveRequest],
+    cache: &mut SimMoveCache,
+    config: &MoverConfig,
+) -> HashMap<CreepId, Direction> {
+    screeps_sim_core::resolve_moves_via_system_with(
         &world.movement,
         requests,
         cache,
         CombatWorldCostSource::from_world(world, owner),
+        config,
     )
 }
 

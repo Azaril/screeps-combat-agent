@@ -7,10 +7,10 @@
 //! routes the squad's W×H box around walls; a [`AnchorOutcome::Blocked`] anchor surfaces a path
 //! failure for the owner to respond to.
 
-use crate::pathing::{build_combat_matrix, move_request_from_intent, resolve_moves_via_system};
+use crate::pathing::{build_combat_matrix, move_request_from_intent, resolve_moves_via_system_with};
 use crate::{to_engine_action, SimView};
 // The movement request/cache types live in the kernel now (ADR 0033 M1); import them directly.
-use screeps_sim_core::{SimMoveCache, SimMoveRequest};
+use screeps_sim_core::{MoverConfig, SimMoveCache, SimMoveRequest};
 use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_decision::{
     cohesion, decide_combat, decide_movement, decide_squad_with_pathing,
@@ -69,9 +69,19 @@ pub struct SimSquad {
     /// Per-creep movement state (cached path + stuck tracking) for the rover `MovementSystem`,
     /// persisted across ticks so path reuse + the resolver's stuck-escalation accumulate (matches live).
     move_cache: SimMoveCache,
+    /// Rover tunables for this squad's mover (ADR 0033 M5 combat-corpus tournament seam).
+    /// `Default::default()` mirrors live exactly, so an unconfigured squad is byte-identical.
+    mover_config: MoverConfig,
 }
 
 impl SimSquad {
+    /// Override the rover tunables for this squad's moves (the combat-corpus parameter-tournament
+    /// seam — e.g. adjudicating rover-eval's haul-tuned `ladder(8)` escalation on combat outcomes).
+    pub fn with_mover_config(mut self, config: MoverConfig) -> Self {
+        self.mover_config = config;
+        self
+    }
+
     /// The squad's bounding-box footprint `(w,h)` from its layout — the size the anchor path must
     /// fit (so the block routes as a unit, never threading a gap narrower than itself).
     pub fn footprint(&self) -> (u8, u8) {
@@ -247,9 +257,13 @@ impl SimSquad {
         // (swaps / shoves / stuck-escalation), the same mover the live bot uses, then apply the
         // resolved directions. The folded slots above give a good (distinct) target geometry; the
         // resolver deconflicts whatever collisions remain — sim ≡ live.
-        for (id, dir) in
-            resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache)
-        {
+        for (id, dir) in resolve_moves_via_system_with(
+            world,
+            self.owner,
+            &move_reqs,
+            &mut self.move_cache,
+            &self.mover_config,
+        ) {
             intents.set_move(id, dir);
         }
         (intents, outcome)
@@ -290,6 +304,9 @@ pub struct ManagedSimSquad {
     /// Set by the drain-tactic proving test ([`Self::with_drain_stance`]); default `false` (every other
     /// squad takes the byte-unchanged breach/engage path). Drain comps do NOT reach the live bot at P1.
     drain_stance: bool,
+    /// Rover tunables for this squad's mover (ADR 0033 M5 combat-corpus tournament seam).
+    /// `Default::default()` mirrors live exactly, so an unconfigured squad is byte-identical.
+    mover_config: MoverConfig,
 }
 
 /// Consecutive no-enemy-HP-progress ticks before a Destroy squad treats the fight as a stalemate and
@@ -311,7 +328,15 @@ impl ManagedSimSquad {
             stall_ticks: 0,
             shove_enabled: true,
             drain_stance: false,
+            mover_config: MoverConfig::default(),
         }
+    }
+
+    /// Override the rover tunables for this squad's moves (the combat-corpus parameter-tournament
+    /// seam — e.g. adjudicating rover-eval's haul-tuned `ladder(8)` escalation on combat outcomes).
+    pub fn with_mover_config(mut self, config: MoverConfig) -> Self {
+        self.mover_config = config;
+        self
     }
 
     /// Enable/disable shoving for this squad's moves (the investigated control — A/B shoving's effect on
@@ -383,9 +408,13 @@ impl ManagedSimSquad {
                 .iter()
                 .filter_map(|&id| move_request_from_intent(id, &goal))
                 .collect();
-            for (id, dir) in
-                resolve_moves_via_system(world, self.owner, &reqs, &mut self.move_cache)
-            {
+            for (id, dir) in resolve_moves_via_system_with(
+                world,
+                self.owner,
+                &reqs,
+                &mut self.move_cache,
+                &self.mover_config,
+            ) {
                 intents.set_move(id, dir);
             }
             return intents;
@@ -551,9 +580,13 @@ impl ManagedSimSquad {
             }
         }
         // ONE traffic-managed pass for the whole squad (rover MovementSystem + resolver), like live.
-        for (id, dir) in
-            resolve_moves_via_system(world, self.owner, &move_reqs, &mut self.move_cache)
-        {
+        for (id, dir) in resolve_moves_via_system_with(
+            world,
+            self.owner,
+            &move_reqs,
+            &mut self.move_cache,
+            &self.mover_config,
+        ) {
             intents.set_move(id, dir);
         }
         intents
@@ -599,6 +632,7 @@ mod tests {
             objective,
             loose: false,
             move_cache: SimMoveCache::default(),
+            mover_config: MoverConfig::default(),
         }
     }
 
@@ -1070,6 +1104,7 @@ mod tests {
             objective: pos(30, 25),
             loose: false,
             move_cache: SimMoveCache::default(),
+            mover_config: MoverConfig::default(),
         };
         for _ in 0..90 {
             let (intents, _) = squad.step(&world);
