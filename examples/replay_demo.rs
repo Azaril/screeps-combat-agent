@@ -1,24 +1,19 @@
-//! Emit combat replay SVGs (P2.H4 demo): run our AI (`IbexAgent`) vs the scripted opponent roster
-//! across the adversarial scenarios, capture each per-tick recording, and render it as an SVG
-//! filmstrip (open the `.svg` and scrub left→right through ticks).
+//! Emit combat replay dumps (P2.H4 demo): run our AI (`IbexAgent`) vs the scripted opponent roster
+//! across the adversarial scenarios, capture each per-tick [`CombatRecording`], and write it as the
+//! engine's text scrubber (`recording.render()`) — read top→bottom through ticks to see the
+//! engagement unfold.
 //!
-//! `cargo run --example replay_demo -p screeps-combat-agent` → writes `target/replays/*.svg`.
+//! `cargo run --example replay_demo -p screeps-combat-agent` → writes `target/replays/*.txt`.
+//!
+//! Note: the SVG filmstrip that used to live here (`screeps_combat_agent::replay`) was removed
+//! (commit c56ad6e) — the richer interactive HTML replay player now lives in `screeps-combat-eval`
+//! (`harness::visualize::replay_to_html`, host-only). This crate keeps only the engine's built-in
+//! text dump, since it can't depend on the eval crate (eval depends on the agent, not vice versa).
 
 use screeps::{Part, Position, RoomCoordinate};
 use screeps_combat_agent::opponents::{run_engagement, world_from_units, DrainAgent, RushAgent, TurtleAgent, Unit};
-use screeps_combat_agent::{replay, IbexAgent};
-use screeps_combat_engine::{CombatRecording, CombatWorld, SimBody, SimCreep, SimTower};
-
-/// Evenly sample a recording down to at most `max` frames (always keeping first + last) — a compact
-/// replay for inline viewing.
-fn sample(rec: &CombatRecording, max: usize) -> CombatRecording {
-    let l = rec.frames.len();
-    if l <= max {
-        return rec.clone();
-    }
-    let frames = (0..max).map(|i| rec.frames[i * (l - 1) / (max - 1)].clone()).collect();
-    CombatRecording { frames }
-}
+use screeps_combat_agent::IbexAgent;
+use screeps_combat_engine::{CombatWorld, SimBody, SimCreep, SimTower};
 
 fn p(x: u8, y: u8) -> Position {
     Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), "W1N1".parse().unwrap())
@@ -78,9 +73,8 @@ fn main() {
 }
 
 fn write(dir: &std::path::Path, name: &str, out: &screeps_combat_agent::opponents::EngagementOutcome) {
-    // Full filmstrip + a compact (≤6-frame) version for inline viewing.
-    std::fs::write(dir.join(format!("{name}.svg")), replay::to_svg(&out.recording)).expect("write svg");
-    std::fs::write(dir.join(format!("{name}_compact.svg")), replay::to_svg(&sample(&out.recording, 6))).expect("write svg");
+    // The engine's built-in per-tick text scrubber (deterministic — frames/rows are id-sorted).
+    std::fs::write(dir.join(format!("{name}.txt")), out.recording.render()).expect("write replay");
     println!(
         "{:28} ticks={:2} a_alive={} b_alive={} cohesion_a={} tower_e={}",
         name, out.ticks, out.side_a_alive, out.side_b_alive, out.worst_cohesion_a, out.side_b_tower_energy
