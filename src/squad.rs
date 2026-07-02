@@ -445,8 +445,11 @@ pub struct ManagedSimSquad {
 }
 
 /// Consecutive no-enemy-HP-progress ticks before a Destroy squad treats the fight as a stalemate and
-/// disengages (don't burn `CREEP_LIFE_TIME` on an un-closable standoff).
-const STALL_LIMIT: u32 = 40;
+/// disengages (don't burn `CREEP_LIFE_TIME` on an un-closable standoff). REC-063: this ALIASES the
+/// shared kernel constant `screeps_combat_decision::ENEMY_STALL_TICKS` (was a local `40` literal that
+/// could silently drift from the kernel's) — the sim driver and the live adapter (`squad_manager`) now
+/// report `enemy_stalled` off the SAME threshold the kernel documents.
+const STALL_LIMIT: u32 = screeps_combat_decision::ENEMY_STALL_TICKS;
 
 impl ManagedSimSquad {
     pub fn new(owner: PlayerId, members: Vec<CreepId>, objective: Position) -> Self {
@@ -517,10 +520,6 @@ impl ManagedSimSquad {
     pub fn step(&mut self, world: &CombatWorld) -> Intents {
         let room = self.objective.room_name();
 
-        // TRAVEL phase (cross-room): the in-room `SimView` below is scoped to the objective room, so a
-        // squad whose members are still in another room would be invisible to it (no intents → no
-        // movement). Until the whole living squad has crossed into the objective room, path it there via
-        // the per-creep rover (which crosses borders); the in-room combat brain runs only once arrived.
         let living_ids: Vec<CreepId> = self
             .members
             .iter()
@@ -543,49 +542,97 @@ impl ManagedSimSquad {
                 .iter()
                 .any(|c| c.id == id && c.is_alive() && c.pos.room_name() == room)
         };
-        if !living_ids.iter().copied().all(in_objective_room) {
-            let mut intents = Intents::new();
-            let goal = CombatIntent::MoveTo {
-                target: self.objective,
-                range: 1,
-            };
-            let mut reqs: Vec<SimMoveRequest> = living_ids
-                .iter()
-                .filter_map(|&id| {
-                    move_request_from_intent(id, &goal).map(|mut req| {
-                        if let Some(&bid) = self.priority_bids.get(&id) {
-                            req = req.with_priority_value(bid);
-                        }
-                        req
+
+        // REC-053 — PER-MEMBER travel gate (was: whole-squad blackout). The in-room `SimView` below is
+        // scoped so its combat brain only reads in-room members; but the earlier all-or-nothing gate
+        // returned move-ONLY intents for the WHOLE squad the moment any one member was out of room — no
+        // `decide_combat`/heal for the in-room majority, and it force-marched even a fleeing member back.
+        // Live has NO analogue: each per-creep `SquadCombatJob` fights every tick and a crossed member
+        // HOLDS (squad_combat.rs `cross_room_formation_target`). We now scope the gate PER MEMBER:
+        //   * OUT-of-room members get a travel request (`MoveTo(objective, 1)`) — EXCEPT while the squad is
+        //     `Retreating`, when force-marching a fleeing member back into the fight is exactly wrong; they
+        //     get a local `Flee` from nearby hostiles instead (the sim-parity half of REC-054: live's
+        //     Retreating arm gives an out-of-room member `Flee`, never re-entry).
+        //   * IN-room members run the full in-room brain below (`decide_squad_with_pathing` + `decide_combat`
+        //     + `decide_movement`), so a border-adjacent squad with one crossed member still fights with
+        //     the rest — matching live.
+        // Both sets are resolved in ONE traffic-managed pass at the end, like the live per-tick mover.
+        let out_of_room_ids: Vec<CreepId> = living_ids
+            .iter()
+            .copied()
+            .filter(|&id| !in_objective_room(id))
+            .collect();
+        let mut travel_reqs: Vec<SimMoveRequest> = Vec::new();
+        for &id in &out_of_room_ids {
+            let goal = if self.state == SquadOrderState::Retreating {
+                // Withdraw where it stands — a cross-room kite goal is meaningless to an out-of-room
+                // member, and force-marching it back toward the objective would re-enter the fight.
+                let pos = world
+                    .movement
+                    .creeps
+                    .iter()
+                    .find(|c| c.id == id && c.is_alive())
+                    .map(|c| c.pos);
+                let threats: Vec<Position> = pos
+                    .map(|p| {
+                        world
+                            .movement
+                            .creeps
+                            .iter()
+                            .filter(|c| c.is_alive() && c.owner != self.owner && c.pos.room_name() == p.room_name())
+                            .map(|c| c.pos)
+                            .collect()
                     })
+                    .unwrap_or_default();
+                if threats.is_empty() {
+                    None // nothing to flee locally → hold (a range-0 hold is pushed by the guard below)
+                } else {
+                    Some(CombatIntent::Flee { from: threats, range: 8 })
+                }
+            } else {
+                Some(CombatIntent::MoveTo {
+                    target: self.objective,
+                    range: 1,
                 })
-                .collect();
-            // Holding-as-a-request invariant (vacuous here — every living member got a MoveTo
-            // above — but the guard keeps the "no requestless living member" contract in one shape
-            // across both step phases; see `push_hold_requests`).
-            push_hold_requests(world, &living_ids, &mut reqs);
+            };
+            if let Some(goal) = goal {
+                if let Some(mut req) = move_request_from_intent(id, &goal) {
+                    if let Some(&bid) = self.priority_bids.get(&id) {
+                        req = req.with_priority_value(bid);
+                    }
+                    travel_reqs.push(req);
+                }
+            }
+        }
+        // Every out-of-room member that did not build a request (Retreating with no local threat) still
+        // claims its tile via the hold guard, keeping the "no requestless living member" contract.
+        push_hold_requests(world, &out_of_room_ids, &mut travel_reqs);
+
+        let sim = SimView::from_world(world, self.owner, self.objective, room);
+
+        // Living IN-ROOM members in slot order — `member_views` and the decision index by THIS list.
+        // Out-of-room members are excluded from the combat brain (they travel/flee above), so the squad
+        // decision reflects the PRESENT in-room force (matching live, where crossed members HOLD and only
+        // the in-room subset runs `decide_squad`).
+        let living: Vec<(CreepId, usize)> = self
+            .members
+            .iter()
+            .filter(|&&id| in_objective_room(id))
+            .filter_map(|&id| sim.friend_index(id).map(|fi| (id, fi)))
+            .collect();
+        if living.is_empty() {
+            // No in-room members — only travellers/fleers this tick. Resolve them and return (no combat).
+            let mut intents = Intents::new();
             for (id, dir) in resolve_moves_via_system_with(
                 world,
                 self.owner,
-                &reqs,
+                &travel_reqs,
                 &mut self.move_cache,
                 &self.mover_config,
             ) {
                 intents.set_move(id, dir);
             }
             return intents;
-        }
-
-        let sim = SimView::from_world(world, self.owner, self.objective, room);
-
-        // Living members in slot order — `member_views` and the decision index by THIS list.
-        let living: Vec<(CreepId, usize)> = self
-            .members
-            .iter()
-            .filter_map(|&id| sim.friend_index(id).map(|fi| (id, fi)))
-            .collect();
-        if living.is_empty() {
-            return Intents::new();
         }
         let member_views: Vec<SquadMemberView> = living
             .iter()
@@ -660,7 +707,9 @@ impl ManagedSimSquad {
         };
 
         let mut intents = Intents::new();
-        let mut move_reqs: Vec<SimMoveRequest> = Vec::new();
+        // Seed the request set with the out-of-room travellers/fleers (REC-053) so the whole squad —
+        // in-room fighters + crossed members — resolves in ONE traffic-managed pass, like live.
+        let mut move_reqs: Vec<SimMoveRequest> = std::mem::take(&mut travel_reqs);
         for (idx, &(member_id, fi)) in living.iter().enumerate() {
             let heal_target = decision
                 .heal_assignments
@@ -712,9 +761,9 @@ impl ManagedSimSquad {
             // shared resolver mover with everyone else's so the manager squad gets traffic management.
             // Combat creeps take HIGH priority so they win the forward (shooting) tile over support —
             // otherwise the resolver's neutral tie-break can park the shooter one tile out of range.
-            if let Some(mut req) = decide_movement(&view_i)
-                .iter()
-                .find_map(|mv| move_request_from_intent(member_id, mv))
+            if let Some((mv_intent, mut req)) = decide_movement(&view_i)
+                .into_iter()
+                .find_map(|mv| move_request_from_intent(member_id, &mv).map(|r| (mv, r)))
             {
                 let f = &sim.friends()[fi];
                 let combat = f.has_working(Part::RangedAttack) || f.working_parts(Part::Attack) > 0;
@@ -726,7 +775,12 @@ impl ManagedSimSquad {
                 if let Some(&bid) = self.priority_bids.get(&member_id) {
                     req = req.with_priority_value(bid);
                 }
-                req = req.with_shove(self.shove_enabled);
+                // REC-055 flee-shove alignment: live's `MovementRequest::flee` withdraws with shoving OFF
+                // (`allow_shove=false` — a fleeing creep gets out, it does not shove teammates), so a sim
+                // Flee must NOT shove either, or the two flee semantics diverge. A `MoveTo` still honors
+                // the investigated `shove_enabled` control (default on = the rover default).
+                let shove = if matches!(mv_intent, CombatIntent::Flee { .. }) { false } else { self.shove_enabled };
+                req = req.with_shove(shove);
                 // Anti-scatter anchor: while Engaged + cohesive, confine each member's shoves/swaps to
                 // within the cohesion radius of the centroid so the resolver can't push the block off its
                 // scored tiles (the investigated managed-squad anchoring gap).
@@ -1687,6 +1741,114 @@ mod tests {
         assert!(
             core_hits_1 < core_hits_0,
             "and dismantled the core ({core_hits_0} -> {core_hits_1})"
+        );
+    }
+
+    /// REC-053 — the PER-MEMBER travel gate: a border-adjacent squad with ONE member still crossed
+    /// into the neighbour room must STILL FIGHT with the in-room member(s). The old whole-squad gate
+    /// returned move-ONLY intents for the WHOLE squad the moment any one member was out of room (no
+    /// `decide_combat`/heal), so a border engagement — the exact geometry the eval corpus builds —
+    /// showed deaths/oscillation live would not produce (live: each per-creep job fights every tick,
+    /// the crossed member HOLDS). Here member 1 is in the objective room next to a hostile; member 2 is
+    /// one room west. Member 1 must emit a combat action this tick (it fights); member 2 travels.
+    #[test]
+    fn rec053_in_room_member_fights_while_a_squadmate_is_still_crossed() {
+        let w2: RoomName = "W2N1".parse().unwrap();
+        let p2 = |x: u8, y: u8| {
+            Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), w2)
+        };
+        let ra = |id: CreepId, at: Position| SimCreep {
+            id,
+            owner: 0,
+            pos: at,
+            body: SimBody::unboosted(&[Part::RangedAttack, Part::RangedAttack, Part::Move, Part::Move]),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        let hostile = SimCreep {
+            id: 99,
+            owner: 1,
+            pos: pos(27, 25),
+            body: SimBody::unboosted(&[Part::Attack, Part::Move]),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        let world = CombatWorld {
+            movement: MovementState {
+                // Member 1 IN the objective room (W1N1) at range 2 of the hostile; member 2 one room west.
+                creeps: vec![ra(1, pos(25, 25)), ra(2, p2(45, 25)), hostile],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut squad = ManagedSimSquad::new(0, vec![1, 2], pos(25, 25));
+        let intents = squad.step(&world);
+        // The in-room member fought (a non-move combat action was emitted for it) — the whole-squad
+        // blackout would have produced ZERO combat intents this tick.
+        assert!(
+            intents.creeps.get(&1).is_some_and(|a| !a.is_empty()),
+            "the in-room member fights while its squadmate is still crossed (REC-053)"
+        );
+        // The crossed member got a movement intent (travelling toward the objective), not nothing.
+        assert!(
+            intents.moves.contains_key(&2),
+            "the crossed member travels toward the objective independently"
+        );
+    }
+
+    /// REC-054 — Retreating sim/live parity: a Retreating squad's OUT-of-room member must WITHDRAW where
+    /// it stands, NOT be force-marched back toward the objective. This mirrors the live Retreating arm
+    /// (`squad_manager::apply_squad_decision`), which gives an out-of-room member `Flee` (REC-016), never
+    /// re-entry. Before REC-053 the sim's whole-squad travel gate force-marched EVERY member back to the
+    /// objective the instant one was out of room — so a "retreat" proof on the sim exercised a re-entry
+    /// live never runs. Here the squad enters `Retreating`; member 2 (out of room, with a local hostile)
+    /// must NOT step toward the objective (east).
+    #[test]
+    fn rec054_retreating_out_of_room_member_withdraws_not_marched_back() {
+        let w2: RoomName = "W2N1".parse().unwrap();
+        let p2 = |x: u8, y: u8| {
+            Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), w2)
+        };
+        let ra = |id: CreepId, at: Position| SimCreep {
+            id,
+            owner: 0,
+            pos: at,
+            body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        // A local hostile EAST of member 2 in W2N1 → fleeing it drives member 2 further WEST (away from
+        // the objective, which is EAST in W1N1). Force-marching to the objective would step it EAST.
+        let hostile = SimCreep {
+            id: 99,
+            owner: 1,
+            pos: p2(20, 25),
+            body: SimBody::unboosted(&[Part::RangedAttack, Part::Move]),
+            fatigue: 0,
+            carry_used: 0,
+        };
+        let mut world = CombatWorld {
+            movement: MovementState {
+                creeps: vec![ra(1, pos(5, 25)), ra(2, p2(10, 25)), hostile],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Objective is in W1N1 (EAST of W2N1, which is west of W1N1). Force the squad into Retreating.
+        let mut squad = ManagedSimSquad::new(0, vec![1, 2], pos(5, 25));
+        squad.state = SquadOrderState::Retreating;
+        let before = world.movement.creeps.iter().find(|c| c.id == 2).unwrap().pos;
+        let intents = squad.step(&world);
+        resolve_tick(&mut world, &intents);
+        let after = world.movement.creeps.iter().find(|c| c.id == 2).unwrap().pos;
+        // Member 2 did not step EAST toward the objective (the force-march direction); it withdrew west
+        // from the local threat (or held), staying in its room. Parity with live's out-of-room Flee.
+        assert_eq!(after.room_name(), w2, "the retreating out-of-room member did not cross toward the objective");
+        assert!(
+            after.x().u8() <= before.x().u8(),
+            "it withdrew west from the local threat (or held), NOT east toward the objective (before x={}, after x={})",
+            before.x().u8(),
+            after.x().u8()
         );
     }
 }
