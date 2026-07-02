@@ -419,6 +419,13 @@ pub struct ManagedSimSquad {
     /// no headway on it. Past [`STALL_LIMIT`] the squad reports `enemy_stalled` (disengage under Destroy).
     prev_enemy_hits: Option<u32>,
     stall_ticks: u32,
+    /// REC-062 — the STRUCTURE twin of `prev_enemy_hits`/`stall_ticks`: the previous tick's total hits of
+    /// the hostile structures + consecutive no-raze-headway ticks. Past [`STALL_LIMIT`] the squad
+    /// reports `structure_stalled`, so the harmless-turtle disengage distinguishes an un-razable turtle
+    /// (structure hits flat) from a slow raze (hits dropping ⇒ NOT stalled). Same cadence/reset as the
+    /// enemy tracker, mirroring the live adapter (`squad_manager`) for sim/live parity.
+    prev_structure_hits: Option<u32>,
+    structure_stall_ticks: u32,
     /// Whether the resolver may shove/swap others to reach a tile (the rover default). Off = A/B the
     /// effect of shoving on positioning (the investigated control).
     shove_enabled: bool,
@@ -464,6 +471,8 @@ impl ManagedSimSquad {
             intent: EngageObjective::Destroy,
             prev_enemy_hits: None,
             stall_ticks: 0,
+            prev_structure_hits: None,
+            structure_stall_ticks: 0,
             shove_enabled: true,
             drain_stance: false,
             mover_config: crate::pathing::combat_mover_config(),
@@ -678,6 +687,26 @@ impl ManagedSimSquad {
         self.prev_enemy_hits = Some(enemy_hits);
         let enemy_stalled = self.stall_ticks >= STALL_LIMIT;
 
+        // REC-062 — the STRUCTURE twin: total hits of the hostile structures; no decrease for
+        // STALL_LIMIT ticks ⇒ no raze headway → report structure_stalled. Same cadence/reset rule as the
+        // enemy tracker above (grow while flat-or-up, reset on any decrease), so the harmless-turtle
+        // disengage fires only when NEITHER creeps NOR structures are moving (an un-razable turtle) and
+        // NOT during a slow raze (dropping hits reset the streak). Mirrors `squad_manager` (live parity).
+        let structure_hits: u32 = sim
+            .structures()
+            .iter()
+            .filter(|s| s.ownership == screeps_combat_decision::Ownership::Hostile && s.hits > 0)
+            .map(|s| s.hits)
+            .sum();
+        match self.prev_structure_hits {
+            Some(prev) if structure_hits >= prev => {
+                self.structure_stall_ticks = self.structure_stall_ticks.saturating_add(1)
+            }
+            _ => self.structure_stall_ticks = 0,
+        }
+        self.prev_structure_hits = Some(structure_hits);
+        let structure_stalled = self.structure_stall_ticks >= STALL_LIMIT;
+
         let view = SquadView {
             members: &member_views,
             hostiles: sim.hostiles(),
@@ -688,6 +717,7 @@ impl ManagedSimSquad {
             enemy_safe_mode: world.safe_mode_owner.is_some_and(|o| o != self.owner),
             engage_objective: self.intent,
             enemy_stalled,
+            structure_stalled,
             drain_stance: self.drain_stance,
         };
         let decision = decide_squad_with_pathing(
