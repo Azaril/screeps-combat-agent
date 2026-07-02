@@ -20,6 +20,7 @@ use screeps_combat_decision::{
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
 use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority};
+use std::collections::{HashMap, HashSet};
 
 /// Members within this Chebyshev distance of their slot count as "in formation".
 const COHESION_TOL: u32 = 1;
@@ -51,6 +52,123 @@ fn offset_pos(anchor: Position, (dx, dy): (i32, i32)) -> Position {
         RoomCoordinate::new(y as u8).expect("0..=49"),
         anchor.room_name(),
     )
+}
+
+/// HOLDING-AS-A-REQUEST (ADR 0033 M5 end-state item (1), operator-ratified 2026-07-01): every
+/// LIVING squad member that built no movement request this tick gets an explicit HOLD —
+/// `move_to(its own tile, range 0)` at [`MovementPriority::Immovable`]. Holding is a first-class
+/// claim on the tile, not an absence: the request makes the holder a resolver-known ACTIVE
+/// occupant (squadmates sidestep it deliberately instead of pathing into it optimistically and
+/// burning engine-rejected intents — the `failed_into_parked` class, ADR 0033 §M4 F2), and
+/// `Immovable` means a squadmate can never shove a holder out of formation (enum-checked in
+/// rover's `try_shove`, never value-checked — the `RosterWiped`/oscillation failure that forced
+/// the registration opt-out, now closed at the source). Encoding cost: a dest==pos range-0
+/// `MoveTo` short-circuits rover's arrival check (`get_range_to <= range`,
+/// movementsystem.rs) — NO pathfinding, no path-cache mutation, resolves `Arrived` every tick
+/// (no oscillation); the occupancy entry rides the request's default `shove: true`
+/// (`allow_shove || allow_swap` gates the arrived-entry insertion; `Immovable` overrides the
+/// occupant-consent check regardless). A holder with fatigue > 0 is skipped by rover before
+/// entry insertion (invisible for that tick) — same as any fatigued mover, bounded and rare for
+/// a creep that did not move. With holds in place a squad has NO unrequested members, which is
+/// what makes kernel-default idle registration re-adoptable in combat (see
+/// [`combat_mover_config`](crate::pathing::combat_mover_config)).
+fn push_hold_requests(
+    world: &CombatWorld,
+    members: &[CreepId],
+    move_reqs: &mut Vec<SimMoveRequest>,
+) {
+    let living_pos = |id: CreepId| {
+        world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == id && c.is_alive())
+            .map(|c| c.pos)
+    };
+    let requested: HashSet<CreepId> = move_reqs.iter().map(|r| r.creep).collect();
+    for &id in members {
+        if requested.contains(&id) {
+            continue;
+        }
+        if let Some(pos) = living_pos(id) {
+            move_reqs.push(
+                SimMoveRequest::move_to(id, pos, 0).with_priority(MovementPriority::Immovable),
+            );
+        }
+    }
+}
+
+/// Ticks a member's range-0 goal must stay DOOMED (destination = a squadmate's held tile, member
+/// already adjacent) before [`convert_persistent_doomed_goals`] converts it to a hold. Transient
+/// pack conflicts (an assaulting blob flowing around in-position members — holders re-decide
+/// within a tick or two) must pass through untouched: an IMMEDIATE conversion cascaded freezes
+/// through the pack (each frozen member becomes a new holder) and congealed the assembler bed
+/// short of its objective — 6 of 8 dead + `Stalled` where bare holds killed in 35 ticks. The
+/// permanent overlap this targets (designed#5: a static member-goal on a static holder, 100+
+/// ticks) trips the streak immediately after the grace.
+const DOOMED_GOAL_HOLD_AFTER: u16 = 3;
+
+/// The DANCE DAMPER (holding-as-a-request follow-on): a range-0 `MoveTo` whose destination is a
+/// squadmate's HELD tile cannot complete while the hold lasts (the holder is `Immovable` — never
+/// shoved, never swapped), and once the mover is ADJACENT the resolver's per-tick local avoidance
+/// turns it into a period-2 sidestep DANCE with no exit: active-occupant denials deliberately do
+/// not feed denial-as-stuck, adjacent one-step paths reset rover's stuck state through the
+/// path-exhaustion regenerate, and the combat matrices carry no friendly layer for escalation
+/// repaths to price (measured: designed#0 1.6%→24% / designed#5 →81% period-2 oscillation when
+/// bare holds landed — movers ping-ponging on the two avoidance tiles flanking a holder,
+/// forever). After [`DOOMED_GOAL_HOLD_AFTER`] consecutive doomed ticks the member converts to a
+/// hold: it stands and FIGHTS from where it is (combat intents were already emitted), burning
+/// zero move intents. Distant movers are never touched (approach must not freeze), and the
+/// streak resets the moment the goal changes or the holder vacates — so only the persistent
+/// decision-layer overlap (member-goal scoring assigning an occupied held tile; a combat-decision
+/// follow-up, out of this crate) is damped, as the honest intent-clean stand it is.
+fn convert_persistent_doomed_goals(
+    world: &CombatWorld,
+    move_reqs: &mut [SimMoveRequest],
+    streaks: &mut HashMap<CreepId, (Position, u16)>,
+) {
+    let held: HashSet<Position> = move_reqs
+        .iter()
+        .filter(|r| r.priority == MovementPriority::Immovable)
+        .filter_map(|r| match &r.goal {
+            screeps_sim_core::SimMoveGoal::To { target, .. } => Some(*target),
+            _ => None,
+        })
+        .collect();
+    let mut doomed_now: HashSet<CreepId> = HashSet::new();
+    for req in move_reqs.iter_mut() {
+        if req.priority == MovementPriority::Immovable {
+            continue;
+        }
+        let screeps_sim_core::SimMoveGoal::To { target, range: 0 } = &req.goal else {
+            continue;
+        };
+        let target = *target;
+        if !held.contains(&target) {
+            continue;
+        }
+        let adjacent = world
+            .movement
+            .creeps
+            .iter()
+            .find(|c| c.id == req.creep && c.is_alive())
+            .map(|c| (c.pos, c.pos.get_range_to(target) <= 1));
+        let Some((pos, true)) = adjacent else {
+            continue;
+        };
+        let streak = match streaks.get(&req.creep) {
+            Some(&(t, n)) if t == target => n + 1,
+            _ => 1,
+        };
+        streaks.insert(req.creep, (target, streak));
+        doomed_now.insert(req.creep);
+        if streak >= DOOMED_GOAL_HOLD_AFTER {
+            *req = SimMoveRequest::move_to(req.creep, pos, 0)
+                .with_priority(MovementPriority::Immovable);
+        }
+    }
+    // A member no longer doomed (goal changed / holder vacated / member died) resets cleanly.
+    streaks.retain(|id, _| doomed_now.contains(id));
 }
 
 /// A squad in the sim: an anchor mover + ordered members (member `i` holds `layout[i]`).
@@ -253,6 +371,11 @@ impl SimSquad {
             };
             move_reqs.push(SimMoveRequest::move_to(member_id, target, range));
         }
+        // Holding-as-a-request invariant (see `push_hold_requests`): the loop above requests every
+        // living member today, so this is the catch-all guard — no living member may end the tick
+        // requestless (an unrequested member would be invisible to the resolver or, registered,
+        // shoveable out of formation).
+        push_hold_requests(world, &self.members, &mut move_reqs);
         // ONE traffic-managed pass: route every member through rover's `MovementSystem` + resolver
         // (swaps / shoves / stuck-escalation), the same mover the live bot uses, then apply the
         // resolved directions. The folded slots above give a good (distinct) target geometry; the
@@ -307,6 +430,18 @@ pub struct ManagedSimSquad {
     /// Rover tunables for this squad's mover (ADR 0033 M5 combat-corpus tournament seam).
     /// `Default::default()` mirrors live exactly, so an unconfigured squad is byte-identical.
     mover_config: MoverConfig,
+    /// §D5.4 decision-9 per-member NUMERIC priority bids (creep id → i64 on rover's shared
+    /// priority lane, `MovementPriority::anchor_value` documents the anchors/spacing) — the
+    /// offline w-as-priority COMBAT-GATE seam (`combat-eval/harness/mover_adjudication.rs`): a
+    /// member present in the map gets `.with_priority_value(bid)` on its movement request, so
+    /// resolver contention orders by the bid instead of the enum anchor (the enum tier still
+    /// rides along as the fallback/anchor). Members absent from the map keep pure enum ordering;
+    /// HOLD requests never bid (`Immovable` semantics stay enum-checked and value-free). Default
+    /// empty = byte-identical to the historical enum-only behavior.
+    priority_bids: HashMap<CreepId, i64>,
+    /// Per-member consecutive-doomed-goal streaks for the dance damper (see
+    /// [`convert_persistent_doomed_goals`]) — persisted across ticks like `move_cache`.
+    doomed_streaks: HashMap<CreepId, (Position, u16)>,
 }
 
 /// Consecutive no-enemy-HP-progress ticks before a Destroy squad treats the fight as a stalemate and
@@ -329,6 +464,8 @@ impl ManagedSimSquad {
             shove_enabled: true,
             drain_stance: false,
             mover_config: crate::pathing::combat_mover_config(),
+            priority_bids: HashMap::new(),
+            doomed_streaks: HashMap::new(),
         }
     }
 
@@ -336,6 +473,14 @@ impl ManagedSimSquad {
     /// seam — e.g. adjudicating rover-eval's haul-tuned `ladder(8)` escalation on combat outcomes).
     pub fn with_mover_config(mut self, config: MoverConfig) -> Self {
         self.mover_config = config;
+        self
+    }
+
+    /// Set per-member NUMERIC priority bids (see the `priority_bids` field doc — the §D5.4
+    /// decision-9 offline w-as-priority combat-gate seam). Members absent from the map keep
+    /// their enum tier; holds never bid.
+    pub fn with_priority_bids(mut self, bids: HashMap<CreepId, i64>) -> Self {
+        self.priority_bids = bids;
         self
     }
 
@@ -404,10 +549,21 @@ impl ManagedSimSquad {
                 target: self.objective,
                 range: 1,
             };
-            let reqs: Vec<SimMoveRequest> = living_ids
+            let mut reqs: Vec<SimMoveRequest> = living_ids
                 .iter()
-                .filter_map(|&id| move_request_from_intent(id, &goal))
+                .filter_map(|&id| {
+                    move_request_from_intent(id, &goal).map(|mut req| {
+                        if let Some(&bid) = self.priority_bids.get(&id) {
+                            req = req.with_priority_value(bid);
+                        }
+                        req
+                    })
+                })
                 .collect();
+            // Holding-as-a-request invariant (vacuous here — every living member got a MoveTo
+            // above — but the guard keeps the "no requestless living member" contract in one shape
+            // across both step phases; see `push_hold_requests`).
+            push_hold_requests(world, &living_ids, &mut reqs);
             for (id, dir) in resolve_moves_via_system_with(
                 world,
                 self.owner,
@@ -565,6 +721,11 @@ impl ManagedSimSquad {
                 if combat {
                     req = req.with_priority(MovementPriority::High);
                 }
+                // §D5.4 decision-9 gate seam: a numeric bid (if configured) overrides the enum
+                // tier for resolver ORDERING (the enum stays the anchor fallback).
+                if let Some(&bid) = self.priority_bids.get(&member_id) {
+                    req = req.with_priority_value(bid);
+                }
                 req = req.with_shove(self.shove_enabled);
                 // Anti-scatter anchor: while Engaged + cohesive, confine each member's shoves/swaps to
                 // within the cohesion radius of the centroid so the resolver can't push the block off its
@@ -579,6 +740,15 @@ impl ManagedSimSquad {
                 move_reqs.push(req);
             }
         }
+        // HOLDING-AS-A-REQUEST (the real hole this closes): a member whose `decide_movement`
+        // yielded no movement intent this tick — an in-position shooter/healer that decided to
+        // act, not move — used to end the tick REQUESTLESS: invisible to the resolver (squadmates
+        // pathed into it and burned engine-rejected intents) or, once idle registration ships,
+        // a shoveable Low idle a squadmate could displace out of formation. It now claims its
+        // tile explicitly at `Immovable` (see `push_hold_requests`), and persistent doomed goals
+        // onto held tiles convert to stands after a grace (the dance damper).
+        push_hold_requests(world, &self.members, &mut move_reqs);
+        convert_persistent_doomed_goals(world, &mut move_reqs, &mut self.doomed_streaks);
         // ONE traffic-managed pass for the whole squad (rover MovementSystem + resolver), like live.
         for (id, dir) in resolve_moves_via_system_with(
             world,

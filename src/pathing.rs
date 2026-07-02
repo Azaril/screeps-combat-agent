@@ -457,20 +457,21 @@ impl CostMatrixDataSource for CombatWorldCostSource {
     }
 }
 
-/// The COMBAT-domain mover defaults: [`MoverConfig::default`] with **`register_idle_creeps` OFF**.
-/// "Idle" is domain-dependent: an unrequested hauler is parked junk, but an unrequested COMBAT
-/// creep is usually HOLDING — an in-position shooter/tank that decided to attack, not move, this
-/// tick. Registering holders as shoveable idles lets squadmates displace them out of formation and
-/// dance-avoid their held tiles — measured as a drain-soak squad wiping (`RosterWiped`) and >10%
-/// period-2 positioning oscillation on the combat-eval beds the moment the kernel default flipped
-/// ON (2026-07-01). Split default, same discipline as the `ladder(8)` adjudication. The recorded
-/// end-state fix is to make HOLDING a first-class request (move_to own tile at `Immovable`), after
-/// which combat can re-adopt registration; until then combat opts out here, in ONE place.
+/// The COMBAT-domain mover defaults — the SINGLE combat-config point. Now **identical to the
+/// kernel default ([`MoverConfig::default`]), `register_idle_creeps` ON included**: the split
+/// default (registration OFF, 2026-07-01) existed because an unrequested COMBAT creep was
+/// usually HOLDING — an in-position shooter/tank that decided to attack, not move — and
+/// registering holders as shoveable Low idles let squadmates displace them out of formation and
+/// dance-avoid their held tiles (measured: drain-soak `RosterWiped`, >10% period-2 oscillation).
+/// That drain-wipe mechanism is CLOSED by holding-as-a-request (ADR 0033 end-state item (1),
+/// `squad::push_hold_requests`): every living squad member now claims its held tile explicitly
+/// (`move_to` own tile, range 0, `Immovable` — never displaceable, enum-checked in the
+/// resolver), so no unrequested creep exists INSIDE a squad and registration only catches
+/// genuinely ownerless idlers — same-owner creeps outside any squad's request set — which are
+/// parked junk in combat exactly as in the economy domain. Kept as a fn (not an alias) so combat
+/// keeps ONE opt-out point if the domains ever diverge again.
 pub fn combat_mover_config() -> MoverConfig {
-    MoverConfig {
-        register_idle_creeps: false,
-        ..Default::default()
-    }
+    MoverConfig::default()
 }
 
 /// Run rover's `MovementSystem` (resolver included) over `world` for `owner`'s `requests`, returning
@@ -479,7 +480,8 @@ pub fn combat_mover_config() -> MoverConfig {
 /// combat routing policy — [`CombatWorldCostSource`] (towers / ADR-0024 threat field / structures as
 /// obstacles) — and forwards the pure `MovementState`. `cache` persists per-creep path reuse +
 /// stuck-escalation across ticks. Traffic-managed, unified analogue of routing each creep alone.
-/// Defaults to [`combat_mover_config`] (NOT the kernel default — see its idle-registration note).
+/// Defaults to [`combat_mover_config`] (currently ≡ the kernel default — holding-as-a-request
+/// closed the registration split; the fn stays the single combat-config point).
 pub fn resolve_moves_via_system(
     world: &CombatWorld,
     owner: PlayerId,
