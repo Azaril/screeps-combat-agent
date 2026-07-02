@@ -65,9 +65,10 @@ fn offset_pos(anchor: Position, (dx, dy): (i32, i32)) -> Position {
 /// the registration opt-out, now closed at the source). Encoding cost: a dest==pos range-0
 /// `MoveTo` short-circuits rover's arrival check (`get_range_to <= range`,
 /// movementsystem.rs) — NO pathfinding, no path-cache mutation, resolves `Arrived` every tick
-/// (no oscillation); the occupancy entry rides the request's default `shove: true`
-/// (`allow_shove || allow_swap` gates the arrived-entry insertion; `Immovable` overrides the
-/// occupant-consent check regardless). A holder with fatigue > 0 is skipped by rover before
+/// (no oscillation); since slice 7 an arrived request ALWAYS yields an occupancy entry — a
+/// no-consent arrived request becomes a pre-resolved FIRM occupant (consent governs
+/// DISPLACEMENT, never visibility; `Immovable` additionally overrides occupant consent in
+/// `try_shove`). A holder with fatigue > 0 is skipped by rover before
 /// entry insertion (invisible for that tick) — same as any fatigued mover, bounded and rare for
 /// a creep that did not move. With holds in place a squad has NO unrequested members, which is
 /// what makes kernel-default idle registration re-adoptable in combat (see

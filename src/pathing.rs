@@ -337,8 +337,8 @@ struct RoomObstacles {
 /// Multi-room [`CostMatrixDataSource`] over a whole `CombatWorld` snapshot (vs the single-room
 /// `CombatCostSource` the per-creep path uses) — so the `MovementSystem` can build a cost matrix for
 /// ANY room it routes through. Owns its data (`'static`): per room, walls + swamps (terrain),
-/// structures/towers + hostile creeps (impassable); friendlies are not avoided. Rooms with no content
-/// are all-plain (passable).
+/// structures/towers + hostile creeps (impassable); the `friendly_creeps` layer stays EMPTY by
+/// DECISION (see the record at `get_creep_costs`). Rooms with no content are all-plain (passable).
 struct CombatWorldCostSource {
     rooms: HashMap<RoomName, RoomObstacles>,
 }
@@ -450,6 +450,31 @@ impl CostMatrixDataSource for CombatWorldCostSource {
             }
         }
         Some(CreepCostMatrixCache {
+            // THE COMBAT FRIENDLY-LAYER DECISION (ADR 0033 slice 7, measured 2026-07-02): the
+            // `friendly_creeps` layer stays EMPTY in the combat domain — rover's tier-1/1b
+            // friendly-avoid stuck escalation deliberately reprices NOTHING here (the repath
+            // itself still fires; only the matrix is unchanged). This is a decided outcome, not
+            // an oversight. Populating same-owner tiles (the live `screeps_impl.rs` / rover-eval
+            // `WorldCostSource` shape, escalation-only — first paths keep `friendly_creeps:
+            // false`) was implemented and adjudicated on the combat beds: the finite-tower
+            // drain-soak canary (`multi_member_drain_soak_kills_with_tank_forward_coordination`)
+            // flipped Killed → RosterWiped at u8::MAX (tier-1 repaths pry the heal-the-focus
+            // cluster apart: the tower-focused member's received heal fell ~800 → ~300/t and the
+            // roster was picked off sequentially), → Stalled at a passable 25 stamp (healers
+            // held at range 2 + a post-drain advance freeze), and → the identical wipe even at a
+            // barely-above-plains 3 stamp — ANY nonzero stamp diverges the tier-1 repath
+            // trajectory, and the bed's outcome rides that knife edge (its Killed baseline
+            // already loses 4 of 8 members to focus fire). Threshold decoupling is impossible:
+            // `StuckThresholds::avoid_friendly_creeps` is ALSO the stuck-repath cadence
+            // (`needs_repath_with`), and slowing/disabling it wipes the bed by itself. In a
+            // TIGHT formation the correct response to "stuck behind a squadmate" is the
+            // resolver's lane (hold / shove / swap / denial-as-stuck), not a detour around the
+            // cluster — so enabling this layer waits on choreography that is robust to
+            // repricing (squad-level work: per-request ladders for travellers vs engaged
+            // members, or a drain tactic that re-forms after detours), or an operator-approved
+            // re-pin. The economy domain keeps its MAX pricing (parked miners are exactly what
+            // friendly-avoid exists for); the pinning test below trips if this layer ever
+            // becomes non-empty without that adjudication.
             friendly_creeps: LinearCostMatrix::new(),
             hostile_creeps,
             source_keeper_agro: LinearCostMatrix::new(),
@@ -839,6 +864,60 @@ mod tests {
             reached,
             "the MovementSystem-routed creep crossed the border and reached the target"
         );
+    }
+
+    // THE COMBAT FRIENDLY-LAYER DECISION PIN (ADR 0033 slice 7 — full record at
+    // `CombatWorldCostSource::get_creep_costs`): the combat domain keeps rover's
+    // `friendly_creeps` layer EMPTY, so a tier-1/1b friendly-avoid stuck repath prices the SAME
+    // matrix as the first path (the repath still fires; the repricing is deliberately inert).
+    // Populating same-owner tiles at ANY stamp (u8::MAX live-parity / 25 passable / 3 nudge) was
+    // implemented and adjudicated: each flipped the finite-tower drain-soak canary off its
+    // pinned Killed outcome (RosterWiped / Stalled / RosterWiped — the tier-1 repath trajectory
+    // de-compacts the heal-the-focus cluster). This test TRIPS if the layer ever becomes
+    // non-empty, forcing that adjudication to be re-run rather than drifting in silently.
+    #[test]
+    fn combat_friendly_layer_stays_empty_even_under_escalation_options() {
+        let mut hostile = creep(2, 20, 20);
+        hostile.owner = 1;
+        let world = CombatWorld {
+            movement: MovementState {
+                creeps: vec![creep(1, 10, 10), hostile],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let build = |friendly_on: bool| {
+            let mut cache = CostMatrixCache::default();
+            let mut system = CostMatrixSystem::new(
+                &mut cache,
+                Box::new(CombatWorldCostSource::from_world(&world, 0)),
+            );
+            let options = CostMatrixOptions {
+                friendly_creeps: friendly_on,
+                ..Default::default()
+            };
+            system.build_local_cost_matrix(room(), &options).expect("matrix builds")
+        };
+
+        // First-path default: a squadmate's tile is NOT an obstacle; hostiles always block.
+        let first = build(false);
+        assert_eq!(
+            first.get(pos(10, 10).xy()),
+            0,
+            "first paths are squadmate-transparent (friendly_creeps: false default)"
+        );
+        assert_eq!(first.get(pos(20, 20).xy()), u8::MAX, "hostiles block on first paths");
+
+        // Escalated repath (rover's tier 1/1b flips friendly_creeps on): BY DECISION the matrix
+        // is unchanged — the squadmate's tile stays unpriced (see the decision record).
+        let escalated = build(true);
+        assert_eq!(
+            escalated.get(pos(10, 10).xy()),
+            0,
+            "the combat friendly layer is EMPTY by decision — repopulating it requires \
+             re-adjudicating the drain-soak canary (see get_creep_costs)"
+        );
+        assert_eq!(escalated.get(pos(20, 20).xy()), u8::MAX, "hostiles still block");
     }
 
     #[test]
