@@ -210,7 +210,11 @@ impl CostMatrixDataSource for CombatCostSource {
             hostile_creeps.set(x, y, u8::MAX);
         }
         Some(CreepCostMatrixCache {
-            friendly_creeps: LinearCostMatrix::new(), // friendlies intentionally NOT avoided
+            // Intentionally empty: every caller of `build_combat_matrix` uses default options
+            // (`friendly_creeps: false`), so this layer is never consulted — kite scoring and the
+            // anchor advance must path THROUGH squadmates. The escalating system mover uses
+            // `CombatWorldCostSource`, which DOES price same-owner tiles (see its record).
+            friendly_creeps: LinearCostMatrix::new(),
             hostile_creeps,
             source_keeper_agro: LinearCostMatrix::new(),
         })
@@ -330,6 +334,9 @@ struct RoomObstacles {
     swamps: Vec<(u8, u8)>,
     blockers: Vec<(u8, u8)>,
     hostiles: Vec<(u8, u8)>,
+    /// Same-owner creeps (the pather's side, self included — live parity): the `friendly_creeps`
+    /// layer, priced ONLY under rover's escalation options (see `get_creep_costs`).
+    friendlies: Vec<(u8, u8)>,
     /// ADR 0024 threat-weighted path cost per tile (sparse; empty ⇒ byte-identical to threat-free).
     threat: Vec<(u8, u8, u8)>,
 }
@@ -337,8 +344,10 @@ struct RoomObstacles {
 /// Multi-room [`CostMatrixDataSource`] over a whole `CombatWorld` snapshot (vs the single-room
 /// `CombatCostSource` the per-creep path uses) — so the `MovementSystem` can build a cost matrix for
 /// ANY room it routes through. Owns its data (`'static`): per room, walls + swamps (terrain),
-/// structures/towers + hostile creeps (impassable); the `friendly_creeps` layer stays EMPTY by
-/// DECISION (see the record at `get_creep_costs`). Rooms with no content are all-plain (passable).
+/// structures/towers + hostile creeps (impassable); same-owner creeps populate the
+/// `friendly_creeps` layer at live parity — priced ONLY under rover's tier-1/1b escalation
+/// options, and only for requests whose ladder reaches those tiers (see the decision record at
+/// `get_creep_costs`). Rooms with no content are all-plain (passable).
 struct CombatWorldCostSource {
     rooms: HashMap<RoomName, RoomObstacles>,
 }
@@ -360,17 +369,16 @@ impl CombatWorldCostSource {
                 .blockers
                 .push((t.pos.x().u8(), t.pos.y().u8()));
         }
-        for c in world
-            .movement
-            .creeps
-            .iter()
-            .filter(|c| c.is_alive() && c.owner != me_owner)
-        {
-            rooms
-                .entry(c.pos.room_name())
-                .or_default()
-                .hostiles
-                .push((c.pos.x().u8(), c.pos.y().u8()));
+        for c in world.movement.creeps.iter().filter(|c| c.is_alive()) {
+            let entry = rooms.entry(c.pos.room_name()).or_default();
+            let lane = if c.owner != me_owner {
+                &mut entry.hostiles
+            } else {
+                // Same-owner (self included, matching live's MY_CREEPS sweep) → the
+                // escalation-only friendly layer.
+                &mut entry.friendlies
+            };
+            lane.push((c.pos.x().u8(), c.pos.y().u8()));
         }
         // Terrain for every room that matters — any structure/tower/hostile room (above), any explicit
         // per-room override, AND every (friendly or hostile) creep's room: a room with only friendly
@@ -443,39 +451,44 @@ impl CostMatrixDataSource for CombatWorldCostSource {
     }
 
     fn get_creep_costs(&self, room_name: RoomName) -> Option<CreepCostMatrixCache> {
+        // THE COMBAT FRIENDLY-LAYER DECISION, REVISED (ADR 0033 slice 7 follow-up): the
+        // `friendly_creeps` layer is now POPULATED at live parity — same-owner tiles at
+        // `u8::MAX`, self included (`screeps_impl.rs` / rover-eval `WorldCostSource` verbatim),
+        // escalation-only as everywhere else (first paths keep `friendly_creeps: false`; only a
+        // tier-1/1b friendly-avoid repath prices these tiles). Slice 7 originally left this
+        // layer EMPTY by decision: populating it at ANY stamp (u8::MAX / 25 / 3) flipped the
+        // finite-tower drain-soak canary
+        // (`multi_member_drain_soak_kills_with_tank_forward_coordination`) off its pinned Killed
+        // outcome — tier-1 friendly-avoid repaths pried the heal-the-focus cluster apart (the
+        // focused member's received heal fell ~800 → ~300/t; sequential roster pick-off) — and
+        // threshold decoupling was impossible while `avoid_friendly_creeps` was ALSO the
+        // stuck-repath cadence. Both blockers are now closed at the root:
+        //   (1) rover decoupled the cadence from the tier-1 threshold
+        //       (`StuckThresholds::stuck_repath`), so a ladder can keep the fast repath cadence
+        //       while never flipping the friendly-avoid repricing on; and
+        //   (2) the squad layer splits ladders PER REQUEST (`squad::engaged_stuck_thresholds`):
+        //       engaged/anchored members and formation movers carry unreachable tier-1/1b — their
+        //       stuck repaths keep pricing the squadmate-transparent matrix, so the tight
+        //       formation's trajectory is what it was under the empty layer — while out-of-room
+        //       TRAVELLERS keep the default ladder and get the working friendly-avoid this layer
+        //       exists for (route around parked idles/holds — matching the economy domain, where
+        //       parked miners are exactly what friendly-avoid is for).
+        // Re-adjudicated on the full combat beds (agent + eval suites) with the drain-soak
+        // canary holding its pinned Killed outcome. The pinning test below trips if this layer
+        // ever goes empty again (a silent regression to the pre-slice-7 blindness) or leaks
+        // into first-path pricing.
+        let mut friendly_creeps = LinearCostMatrix::new();
         let mut hostile_creeps = LinearCostMatrix::new();
         if let Some(o) = self.rooms.get(&room_name) {
+            for &(x, y) in &o.friendlies {
+                friendly_creeps.set(x, y, u8::MAX);
+            }
             for &(x, y) in &o.hostiles {
                 hostile_creeps.set(x, y, u8::MAX);
             }
         }
         Some(CreepCostMatrixCache {
-            // THE COMBAT FRIENDLY-LAYER DECISION (ADR 0033 slice 7, measured 2026-07-02): the
-            // `friendly_creeps` layer stays EMPTY in the combat domain — rover's tier-1/1b
-            // friendly-avoid stuck escalation deliberately reprices NOTHING here (the repath
-            // itself still fires; only the matrix is unchanged). This is a decided outcome, not
-            // an oversight. Populating same-owner tiles (the live `screeps_impl.rs` / rover-eval
-            // `WorldCostSource` shape, escalation-only — first paths keep `friendly_creeps:
-            // false`) was implemented and adjudicated on the combat beds: the finite-tower
-            // drain-soak canary (`multi_member_drain_soak_kills_with_tank_forward_coordination`)
-            // flipped Killed → RosterWiped at u8::MAX (tier-1 repaths pry the heal-the-focus
-            // cluster apart: the tower-focused member's received heal fell ~800 → ~300/t and the
-            // roster was picked off sequentially), → Stalled at a passable 25 stamp (healers
-            // held at range 2 + a post-drain advance freeze), and → the identical wipe even at a
-            // barely-above-plains 3 stamp — ANY nonzero stamp diverges the tier-1 repath
-            // trajectory, and the bed's outcome rides that knife edge (its Killed baseline
-            // already loses 4 of 8 members to focus fire). Threshold decoupling is impossible:
-            // `StuckThresholds::avoid_friendly_creeps` is ALSO the stuck-repath cadence
-            // (`needs_repath_with`), and slowing/disabling it wipes the bed by itself. In a
-            // TIGHT formation the correct response to "stuck behind a squadmate" is the
-            // resolver's lane (hold / shove / swap / denial-as-stuck), not a detour around the
-            // cluster — so enabling this layer waits on choreography that is robust to
-            // repricing (squad-level work: per-request ladders for travellers vs engaged
-            // members, or a drain tactic that re-forms after detours), or an operator-approved
-            // re-pin. The economy domain keeps its MAX pricing (parked miners are exactly what
-            // friendly-avoid exists for); the pinning test below trips if this layer ever
-            // becomes non-empty without that adjudication.
-            friendly_creeps: LinearCostMatrix::new(),
+            friendly_creeps,
             hostile_creeps,
             source_keeper_agro: LinearCostMatrix::new(),
         })
@@ -866,17 +879,18 @@ mod tests {
         );
     }
 
-    // THE COMBAT FRIENDLY-LAYER DECISION PIN (ADR 0033 slice 7 — full record at
-    // `CombatWorldCostSource::get_creep_costs`): the combat domain keeps rover's
-    // `friendly_creeps` layer EMPTY, so a tier-1/1b friendly-avoid stuck repath prices the SAME
-    // matrix as the first path (the repath still fires; the repricing is deliberately inert).
-    // Populating same-owner tiles at ANY stamp (u8::MAX live-parity / 25 passable / 3 nudge) was
-    // implemented and adjudicated: each flipped the finite-tower drain-soak canary off its
-    // pinned Killed outcome (RosterWiped / Stalled / RosterWiped — the tier-1 repath trajectory
-    // de-compacts the heal-the-focus cluster). This test TRIPS if the layer ever becomes
-    // non-empty, forcing that adjudication to be re-run rather than drifting in silently.
+    // THE COMBAT FRIENDLY-LAYER DECISION PIN, REVISED (ADR 0033 slice 7 follow-up — full record
+    // at `CombatWorldCostSource::get_creep_costs`): the combat domain now POPULATES rover's
+    // `friendly_creeps` layer at live parity (same-owner tiles at u8::MAX), priced ONLY under
+    // the tier-1/1b escalation options — first paths stay squadmate-transparent. What made this
+    // safe: rover's cadence/repricing decoupling (`StuckThresholds::stuck_repath`) + the squad
+    // layer's per-request ladder split (`squad::engaged_stuck_thresholds` — engaged/anchored
+    // members never reach the repricing tiers; travellers do), re-adjudicated on the full combat
+    // beds with the drain-soak canary holding its pinned Killed outcome. This test TRIPS if the
+    // layer goes empty again (silent regression to escalation-blind repaths for travellers) or
+    // leaks into FIRST-path pricing (which would stall tight formations at plan time).
     #[test]
-    fn combat_friendly_layer_stays_empty_even_under_escalation_options() {
+    fn combat_friendly_layer_prices_same_owner_tiles_only_under_escalation() {
         let mut hostile = creep(2, 20, 20);
         hostile.owner = 1;
         let world = CombatWorld {
@@ -908,14 +922,15 @@ mod tests {
         );
         assert_eq!(first.get(pos(20, 20).xy()), u8::MAX, "hostiles block on first paths");
 
-        // Escalated repath (rover's tier 1/1b flips friendly_creeps on): BY DECISION the matrix
-        // is unchanged — the squadmate's tile stays unpriced (see the decision record).
+        // Escalated repath (rover's tier 1/1b flips friendly_creeps on): the squadmate's tile is
+        // priced at live parity — the working friendly-avoid a TRAVELLER's default ladder relies
+        // on (engaged members never reach these options; see `squad::engaged_stuck_thresholds`).
         let escalated = build(true);
         assert_eq!(
             escalated.get(pos(10, 10).xy()),
-            0,
-            "the combat friendly layer is EMPTY by decision — repopulating it requires \
-             re-adjudicating the drain-soak canary (see get_creep_costs)"
+            u8::MAX,
+            "escalation options price same-owner tiles at live parity — emptying this layer \
+             requires re-adjudicating the combat beds (see get_creep_costs)"
         );
         assert_eq!(escalated.get(pos(20, 20).xy()), u8::MAX, "hostiles still block");
     }

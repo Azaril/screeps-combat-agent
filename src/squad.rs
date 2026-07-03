@@ -19,7 +19,9 @@ use screeps_combat_decision::{
     SquadOrderState, SquadStateDto, SquadView,
 };
 use screeps_combat_engine::{CombatWorld, CreepId, Intents, PlayerId};
-use screeps_rover::{AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority};
+use screeps_rover::{
+    AnchorOutcome, AnchorPath, LocalPathfinder, MovementPriority, StuckThresholds,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Members within this Chebyshev distance of their slot count as "in formation".
@@ -31,6 +33,30 @@ const ADVANCE_QUORUM: f32 = screeps_combat_decision::rally::GATHER_QUORUM_RATIO;
 /// Loose-mode (blob / corridor) cohesion radius — members within this of the anchor are gathered. ALIASES
 /// the shared `rally::RALLY_GATHER_RADIUS` (same reason).
 const LOOSE_RADIUS: u32 = screeps_combat_decision::rally::RALLY_GATHER_RADIUS;
+
+/// The ENGAGED/ANCHORED-member stuck ladder (ADR 0033 slice 7 follow-up — what made enabling the
+/// combat `friendly_creeps` layer safe): identical to the default ladder EXCEPT the tier-1/1b
+/// friendly-avoid REPRICING is unreachable. The repath CADENCE is untouched
+/// (`StuckThresholds::stuck_repath` keeps the default — rover decoupled the cadence from the
+/// tier-1 threshold for exactly this ladder), so an engaged member's stuck repaths fire exactly
+/// as they always did but keep pricing the squadmate-transparent matrix its first path used.
+/// That preserves the drain-soak canary's pinned trajectory while the layer is POPULATED (live
+/// parity, `CombatWorldCostSource::get_creep_costs`): tier-1 detours around squadmates were
+/// measured prying the heal-the-focus cluster apart (the focused member's received heal fell
+/// ~800 → ~300/t; sequential roster pick-off — the slice-7 measurement matrix). In a tight
+/// formation the correct response to "stuck behind a squadmate" is the resolver's lane — hold /
+/// shove / swap / denial-as-stuck — plus the squad brain re-deciding goals next tick, never a
+/// detour around the cluster; shove remains reachable (tier 3 / the resolver's constant gate)
+/// where friendly-avoid never is. TRAVELLERS (out-of-room members en route to the objective)
+/// keep the DEFAULT ladder: for a long-haul mover, detouring around parked idles and holds is
+/// exactly right — that working friendly-avoid is the point of populating the layer.
+fn engaged_stuck_thresholds() -> StuckThresholds {
+    StuckThresholds {
+        avoid_friendly_creeps: u16::MAX,
+        avoid_all_friendly_creeps: u16::MAX,
+        ..StuckThresholds::default()
+    }
+}
 
 /// `anchor + (dx,dy)`, with an off-room offset **folded** back into the room (mirrored). Near a room
 /// edge a formation's far slots would land off-map; folding keeps them as DISTINCT in-room tiles so
@@ -114,8 +140,9 @@ const DOOMED_GOAL_HOLD_AFTER: u16 = 3;
 /// shoved, never swapped), and once the mover is ADJACENT the resolver's per-tick local avoidance
 /// turns it into a period-2 sidestep DANCE with no exit: active-occupant denials deliberately do
 /// not feed denial-as-stuck, adjacent one-step paths reset rover's stuck state through the
-/// path-exhaustion regenerate, and the combat matrices carry no friendly layer for escalation
-/// repaths to price (measured: designed#0 1.6%→24% / designed#5 →81% period-2 oscillation when
+/// path-exhaustion regenerate, and an engaged member's escalation repaths deliberately never
+/// price the friendly layer (the engaged ladder, [`engaged_stuck_thresholds`] — the layer itself
+/// is populated for travellers) (measured: designed#0 1.6%→24% / designed#5 →81% period-2 oscillation when
 /// bare holds landed — movers ping-ponging on the two avoidance tiles flanking a holder,
 /// forever). After [`DOOMED_GOAL_HOLD_AFTER`] consecutive doomed ticks the member converts to a
 /// hold: it stands and FIGHTS from where it is (combat intents were already emitted), burning
@@ -370,7 +397,14 @@ impl SimSquad {
                     if loose || crossing { 1 } else { 0 },
                 )
             };
-            move_reqs.push(SimMoveRequest::move_to(member_id, target, range));
+            // Formation members are ENGAGED movers: their stuck repaths stay squadmate-
+            // transparent (the engaged ladder) — slot geometry + the resolver deconflict the
+            // box; a friendly-avoid detour around it is never right (see
+            // `engaged_stuck_thresholds`).
+            move_reqs.push(
+                SimMoveRequest::move_to(member_id, target, range)
+                    .with_stuck_thresholds(engaged_stuck_thresholds()),
+            );
         }
         // Holding-as-a-request invariant (see `push_hold_requests`): the loop above requests every
         // living member today, so this is the catch-all guard — no living member may end the tick
@@ -822,6 +856,12 @@ impl ManagedSimSquad {
                         req = req.with_anchor(center, decision.cohesion_radius);
                     }
                 }
+                // IN-ROOM members are the squad brain's choreography — engaged/anchored movers
+                // whose stuck repaths must stay squadmate-transparent (the engaged ladder; the
+                // out-of-room travellers above keep the default ladder and its working
+                // friendly-avoid). Inert for a `Flee` (rover's flee path carries no stuck
+                // ladder), so applied uniformly.
+                req = req.with_stuck_thresholds(engaged_stuck_thresholds());
                 move_reqs.push(req);
             }
         }
