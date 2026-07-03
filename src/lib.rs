@@ -47,6 +47,7 @@ fn structure_type(kind: StructureKind) -> StructureType {
         StructureKind::Rampart => StructureType::Rampart,
         StructureKind::Wall => StructureType::Wall,
         StructureKind::Tower => StructureType::Tower,
+        StructureKind::InvaderCore => StructureType::InvaderCore,
     }
 }
 
