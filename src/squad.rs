@@ -51,11 +51,9 @@ const LOOSE_RADIUS: u32 = screeps_combat_decision::rally::RALLY_GATHER_RADIUS;
 /// keep the DEFAULT ladder: for a long-haul mover, detouring around parked idles and holds is
 /// exactly right — that working friendly-avoid is the point of populating the layer.
 fn engaged_stuck_thresholds() -> StuckThresholds {
-    StuckThresholds {
-        avoid_friendly_creeps: u16::MAX,
-        avoid_all_friendly_creeps: u16::MAX,
-        ..StuckThresholds::default()
-    }
+    // ONE implementation (review D9): the ladder itself lives in rover (`StuckThresholds::engaged`),
+    // consumed identically by this sim and the live bot's squad_combat wiring — no live/sim drift.
+    StuckThresholds::engaged()
 }
 
 /// `anchor + (dx,dy)`, with an off-room offset **folded** back into the room (mirrored). Near a room
