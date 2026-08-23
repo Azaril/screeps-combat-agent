@@ -61,9 +61,16 @@ fn ownership(owner: Option<PlayerId>, me: PlayerId) -> Ownership {
 
 fn creep_dto(c: &SimCreep, raw: RawObjectId) -> CombatCreepDto {
     let body = (0..c.body.parts.len())
-        .map(|i| CombatBodyPart {
-            part: c.body.parts[i].part,
-            hits: c.body.part_hits(i),
+        .map(|i| {
+            // WS-VAL boost-blind-seam fix: the sim body's per-part tier → the DTO multiplier, so
+            // the shared kernels see boosted sim creeps (stronghold defenders!) at real output.
+            let mult = match c.body.parts[i].boost {
+                screeps_sim_core::BoostTier::None => 1,
+                screeps_sim_core::BoostTier::T1 => 2,
+                screeps_sim_core::BoostTier::T2 => 3,
+                screeps_sim_core::BoostTier::T3 => 4,
+            };
+            CombatBodyPart::boosted(c.body.parts[i].part, c.body.part_hits(i), mult)
         })
         .collect();
     CombatCreepDto {
@@ -733,5 +740,26 @@ mod tests {
                 .is_some_and(|o| o.effective_damage > 0),
             "tower 22 still fired by id"
         );
+    }
+
+    /// WS-VAL (boost-blind-seam fix) — the sim→DTO adapter stamps each part's boost tier as the
+    /// DTO output multiplier (None/T1/T2/T3 → ×1/×2/×3/×4), so the shared kernels price boosted
+    /// sim creeps (stronghold defenders, boosted self-play) at real output. RED against the old
+    /// adapter, which built every part unboosted.
+    #[test]
+    fn creep_dto_stamps_boost_multipliers() {
+        use screeps_combat_engine::constants::HEAL_POWER;
+        use screeps_sim_core::{BodyPartDef, BoostTier};
+        let body = SimBody::new(vec![
+            BodyPartDef::boosted(Part::Heal, BoostTier::T3),
+            BodyPartDef::boosted(Part::RangedAttack, BoostTier::T2),
+            BodyPartDef::boosted(Part::Attack, BoostTier::T1),
+            BodyPartDef::boosted(Part::Move, BoostTier::None),
+        ]);
+        let sim = SimCreep { id: 1, owner: 0, pos: pos(10, 10), body, fatigue: 0, carry_used: 0 };
+        let dto = creep_dto(&sim, "000000000000000000000001".parse().unwrap());
+        let mults: Vec<u8> = dto.body.iter().map(|p| p.boost_mult).collect();
+        assert_eq!(mults, vec![4, 3, 2, 1], "tier → multiplier per part");
+        assert_eq!(dto.effective_output(Part::Heal, HEAL_POWER), 12 * 4, "boosted heal reads ×4");
     }
 }

@@ -683,20 +683,20 @@ impl ManagedSimSquad {
                 SquadMemberView {
                     hits: f.hits,
                     hits_max: f.hits_max,
-                    heal_power: f.working_parts(Part::Heal) as u32,
+                    // WS-VAL boost-blind-seam fix: EFFECTIVE heal parts (boost-multiplied) — the T3
+                    // squad's real sustain, not ¼ of it (the stronghold-gauntlet perma-retreat root).
+                    heal_power: f.effective_output(Part::Heal, screeps_combat_engine::constants::HEAL_POWER)
+                        / screeps_combat_engine::constants::HEAL_POWER,
                     pos: Some(f.pos),
                     has_ranged: f.has_working(Part::RangedAttack),
-                    // Per-tick attack output for the engage DMG reward (ADR 0019 focus_damage richness).
-                    melee_power: f.working_parts(Part::Attack) as u32
-                        * screeps_combat_engine::constants::ATTACK_POWER,
-                    ranged_power: f.working_parts(Part::RangedAttack) as u32
-                        * screeps_combat_engine::constants::RANGED_ATTACK_POWER,
+                    // Per-tick BOOSTED attack output for the engage DMG reward (ADR 0019 richness).
+                    melee_power: f.effective_output(Part::Attack, screeps_combat_engine::constants::ATTACK_POWER),
+                    ranged_power: f.effective_output(Part::RangedAttack, screeps_combat_engine::constants::RANGED_ATTACK_POWER),
                     damage_taken_last_tick: 0,
                     // ADR 0025: the synthetic id (so the kernel's heal intent resolves this ally) + the
                     // structure-damage/declaim capabilities the kernel's action menu prices.
                     id: f.id,
-                    dismantle_power: f.working_parts(Part::Work) as u32
-                        * screeps_combat_engine::constants::DISMANTLE_POWER,
+                    dismantle_power: f.effective_output(Part::Work, screeps_combat_engine::constants::DISMANTLE_POWER),
                     claim_power: f.working_parts(Part::Claim) as u32
                         * screeps_combat_engine::constants::CONTROLLER_ATTACK_PER_PART,
                 }
