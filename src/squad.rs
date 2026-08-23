@@ -556,6 +556,12 @@ impl ManagedSimSquad {
         self
     }
 
+    /// The squad's current order state (as of the last `step`) — harness introspection (the WS-VAL
+    /// gauntlet probes read it to attribute outcomes to the phase the brain was in).
+    pub fn state(&self) -> SquadOrderState {
+        self.state
+    }
+
     /// Advance one tick: build the `SquadView` from living members, run `decide_squad_with_pathing`
     /// (the squad's ONE bounded kite search), then run the per-creep `decide_combat` + `decide_movement`
     /// with the shared directive, returning the engine [`Intents`].
