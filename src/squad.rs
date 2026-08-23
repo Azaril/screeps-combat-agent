@@ -78,6 +78,94 @@ fn offset_pos(anchor: Position, (dx, dy): (i32, i32)) -> Position {
     )
 }
 
+
+/// Gather guidance: how close to the exit edge the band TARGET sits (the mover walks toward it
+/// and parks against the border walls).
+const BORDER_BAND: u32 = 2;
+/// ASSEMBLED test (the bloc-crossing release): every traveller within this radius of the
+/// traveller CENTROID (a tight cluster — pairwise, not on-the-band, because a bordered edge is
+/// mostly WALLS with a few open columns and "stand on the band" is unreachable for most files —
+/// the measured permanent-gather freeze at x=3..5).
+const GATHER_RADIUS: u32 = 4;
+/// ...and the cluster centroid within this many tiles of the exit edge.
+const GATHER_EDGE_SLACK: u32 = 8;
+
+/// The exit edge of the travellers' room toward the objective room — the staging side of the bloc
+/// crossing. 0=W (x=0) · 1=E (x=49) · 2=N (y=0) · 3=S (y=49), in the travellers' room.
+struct ExitEdge {
+    edge: u8,
+    room: screeps::RoomName,
+}
+
+impl ExitEdge {
+    /// Tiles between `pos` and the exit edge (0 = standing on it).
+    fn band_distance(&self, pos: Position) -> u32 {
+        if pos.room_name() != self.room {
+            return u32::MAX; // a traveller in a different room is never "at this band"
+        }
+        let (x, y) = (pos.x().u8() as u32, pos.y().u8() as u32);
+        match self.edge {
+            0 => x,
+            1 => 49 - x,
+            2 => y,
+            _ => 49 - y,
+        }
+    }
+    /// The gather tile at this member's own file — one tile inside the edge, so the mover spreads
+    /// the squad along the open border columns instead of stacking one point.
+    fn band_target(&self, pos: Position) -> Position {
+        let clamp = |v: u8| v.clamp(1, 48);
+        let (x, y) = (pos.x().u8(), pos.y().u8());
+        let (tx, ty) = match self.edge {
+            0 => (1, clamp(y)),
+            1 => (48, clamp(y)),
+            2 => (clamp(x), 1),
+            _ => (clamp(x), 48),
+        };
+        Position::new(
+            screeps::RoomCoordinate::new(tx).unwrap(),
+            screeps::RoomCoordinate::new(ty).unwrap(),
+            self.room,
+        )
+    }
+}
+
+/// Derive the exit edge for the LAST hop of the travellers' journey: the single room every living
+/// traveller stands in, when it is directly adjacent to the objective room. `None` (⇒ no gate) when
+/// travellers span rooms or the hop is not adjacent (multi-hop travel gates on its final room).
+fn exit_edge_toward(objective_room: screeps::RoomName, travellers: &[CreepId], world: &CombatWorld) -> Option<ExitEdge> {
+    let mut rooms = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && travellers.contains(&c.id))
+        .map(|c| c.pos.room_name());
+    let first = rooms.next()?;
+    if rooms.any(|r| r != first) {
+        return None;
+    }
+    let mid = |x: u8, y: u8| {
+        Position::new(
+            screeps::RoomCoordinate::new(x).unwrap(),
+            screeps::RoomCoordinate::new(y).unwrap(),
+            first,
+        )
+    };
+    for (edge, probe, step) in [
+        (0u8, mid(0, 25), (-1i32, 0i32)),
+        (1, mid(49, 25), (1, 0)),
+        (2, mid(25, 0), (0, -1)),
+        (3, mid(25, 49), (0, 1)),
+    ] {
+        if let Ok(p) = probe.checked_add(step) {
+            if p.room_name() == objective_room {
+                return Some(ExitEdge { edge, room: first });
+            }
+        }
+    }
+    None
+}
+
 /// HOLDING-AS-A-REQUEST (ADR 0033 M5 end-state item (1), operator-ratified 2026-07-01): every
 /// LIVING squad member that built no movement request this tick gets an explicit HOLD —
 /// `move_to(its own tile, range 0)` at [`MovementPriority::Immovable`]. Holding is a first-class
@@ -409,6 +497,11 @@ impl SimSquad {
         // requestless (an unrequested member would be invisible to the resolver or, registered,
         // shoveable out of formation).
         push_hold_requests(world, &self.members, &mut move_reqs);
+        if std::env::var("SQ_DEBUG").is_ok() {
+            for r in &move_reqs {
+                if let screeps_sim_core::SimMoveGoal::To { target, range } = &r.goal { eprintln!("  req #{} to({},{},{}) r{} prio={:?}", r.creep, target.room_name(), target.x().u8(), target.y().u8(), range, r.priority); }
+            }
+        }
         // ONE traffic-managed pass: route every member through rover's `MovementSystem` + resolver
         // (swaps / shoves / stuck-escalation), the same mover the live bot uses, then apply the
         // resolved directions. The folded slots above give a good (distinct) target geometry; the
@@ -421,6 +514,7 @@ impl SimSquad {
             &self.mover_config,
         ) {
             intents.set_move(id, dir);
+            if std::env::var("SQ_DEBUG").is_ok() { eprintln!("  resolved #{} -> {:?}", id, dir); }
         }
         (intents, outcome)
     }
@@ -437,6 +531,13 @@ pub struct ManagedSimSquad {
     pub members: Vec<CreepId>,
     /// Where the squad is fighting (the centroid fallback + the room).
     pub objective: Position,
+    /// The squad's RALLY — where it staged/entered from (`with_rally`; the assault runners set the
+    /// objective's entry). Drives the WS-VAL border-crossing discipline: travellers GATHER at the
+    /// border and cross as a bloc (never trickle one at a time into a contested room — the
+    /// operator-observed g1 stall), and a Retreating squad withdraws TOWARD the rally instead of
+    /// freezing on the local anti-threat gradient. `None` (the default) preserves the legacy
+    /// per-member travel behaviour for every existing bed.
+    rally: Option<Position>,
     pub retreat_threshold: f32,
     state: SquadOrderState,
     /// Position-scoring weights (ADR 0019 Stage 4 tuning seam). Defaults to the shipped presets; the
@@ -497,6 +598,7 @@ impl ManagedSimSquad {
             owner,
             members,
             objective,
+            rally: None,
             retreat_threshold: 0.3,
             state: SquadOrderState::Forming,
             tactics: SquadTacticParams::default(),
@@ -562,6 +664,13 @@ impl ManagedSimSquad {
         self.state
     }
 
+    /// Set the squad's RALLY (its staging/entry point) — enables the border-crossing bloc gate +
+    /// withdraw-toward-rally (see the `rally` field doc).
+    pub fn with_rally(mut self, rally: Position) -> Self {
+        self.rally = Some(rally);
+        self
+    }
+
     /// Advance one tick: build the `SquadView` from living members, run `decide_squad_with_pathing`
     /// (the squad's ONE bounded kite search), then run the per-creep `decide_combat` + `decide_movement`
     /// with the shared directive, returning the engine [`Intents`].
@@ -610,38 +719,98 @@ impl ManagedSimSquad {
             .copied()
             .filter(|&id| !in_objective_room(id))
             .collect();
+        // WS-VAL border-crossing discipline (Phase 4.5 item 2 — operator-observed g1 stall: "one
+        // creep enters and then everything outside the room stalls"): with a rally set, travellers
+        // GATHER at the staging side of the border and cross as a BLOC — assembled means every
+        // living traveller stands within BORDER_BAND of the exit edge, so the fastest member can
+        // never trickle into a contested room alone, get the whole squad latched Retreating by the
+        // in-room minority view, and deadlock everyone else. Re-evaluated per tick — no latch.
+        let border_gate = self.rally.and_then(|_| {
+            let exit = exit_edge_toward(room, &out_of_room_ids, world)?;
+            // ASSEMBLED = a tight traveller cluster near the edge (pairwise cohesion, NOT standing
+            // on the band — the bordered edge is mostly walls with a few open columns, so most
+            // files can never reach the band itself).
+            let traveller_pos: Vec<Position> = world
+                .movement
+                .creeps
+                .iter()
+                .filter(|c| c.is_alive() && out_of_room_ids.contains(&c.id))
+                .map(|c| c.pos)
+                .collect();
+            let assembled = !traveller_pos.is_empty() && {
+                let n = traveller_pos.len() as i64;
+                let (sx, sy): (i64, i64) = traveller_pos
+                    .iter()
+                    .fold((0, 0), |(ax, ay), p| (ax + p.x().u8() as i64, ay + p.y().u8() as i64));
+                let centroid = Position::new(
+                    screeps::RoomCoordinate::new((sx / n) as u8).unwrap(),
+                    screeps::RoomCoordinate::new((sy / n) as u8).unwrap(),
+                    exit.room,
+                );
+                traveller_pos.iter().all(|p| p.get_range_to(centroid) <= GATHER_RADIUS)
+                    && exit.band_distance(centroid) <= GATHER_EDGE_SLACK
+            };
+            // ONE shared gather point — the centroid's projection onto the band. Per-file targets
+            // deadlocked: every member 'arrives' at its own band tile while the cluster never
+            // tightens along the edge (measured: one straggler 6 tiles off centroid held the gate
+            // closed forever with everyone parked).
+            let gather = traveller_pos.first().map(|_| {
+                let n = traveller_pos.len() as i64;
+                let (sx, sy): (i64, i64) = traveller_pos
+                    .iter()
+                    .fold((0, 0), |(ax, ay), p| (ax + p.x().u8() as i64, ay + p.y().u8() as i64));
+                exit.band_target(Position::new(
+                    screeps::RoomCoordinate::new((sx / n) as u8).unwrap(),
+                    screeps::RoomCoordinate::new((sy / n) as u8).unwrap(),
+                    exit.room,
+                ))
+            })?;
+            Some((exit, assembled, gather))
+        });
         let mut travel_reqs: Vec<SimMoveRequest> = Vec::new();
         for &id in &out_of_room_ids {
             let goal = if self.state == SquadOrderState::Retreating {
-                // Withdraw where it stands — a cross-room kite goal is meaningless to an out-of-room
-                // member, and force-marching it back toward the objective would re-enter the fight.
-                let pos = world
-                    .movement
-                    .creeps
-                    .iter()
-                    .find(|c| c.id == id && c.is_alive())
-                    .map(|c| c.pos);
-                let threats: Vec<Position> = pos
-                    .map(|p| {
-                        world
-                            .movement
-                            .creeps
-                            .iter()
-                            .filter(|c| c.is_alive() && c.owner != self.owner && c.pos.room_name() == p.room_name())
-                            .map(|c| c.pos)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if threats.is_empty() {
-                    None // nothing to flee locally → hold (a range-0 hold is pushed by the guard below)
+                // Withdraw toward the RALLY when one is set (regroup for a re-entry as a bloc);
+                // legacy (rally-less beds): flee local threats, else hold.
+                if let Some(rally) = self.rally {
+                    Some(CombatIntent::MoveTo { target: rally, range: 3 })
                 } else {
-                    Some(CombatIntent::Flee { from: threats, range: 8 })
+                    let pos = world
+                        .movement
+                        .creeps
+                        .iter()
+                        .find(|c| c.id == id && c.is_alive())
+                        .map(|c| c.pos);
+                    let threats: Vec<Position> = pos
+                        .map(|p| {
+                            world
+                                .movement
+                                .creeps
+                                .iter()
+                                .filter(|c| c.is_alive() && c.owner != self.owner && c.pos.room_name() == p.room_name())
+                                .map(|c| c.pos)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if threats.is_empty() {
+                        None // nothing to flee locally → hold (a range-0 hold is pushed by the guard below)
+                    } else {
+                        Some(CombatIntent::Flee { from: threats, range: 8 })
+                    }
                 }
             } else {
-                Some(CombatIntent::MoveTo {
-                    target: self.objective,
-                    range: 1,
-                })
+                match &border_gate {
+                    // Gathering: close on the exit band (each member heads to the border tile at
+                    // its own file — the mover spreads them along the open columns).
+                    Some((_exit, false, gather)) => {
+                        Some(CombatIntent::MoveTo { target: *gather, range: BORDER_BAND as u8 })
+                    }
+                    // Assembled (or no gate derivable): cross / travel to the objective.
+                    _ => Some(CombatIntent::MoveTo {
+                        target: self.objective,
+                        range: 1,
+                    }),
+                }
             };
             if let Some(goal) = goal {
                 if let Some(mut req) = move_request_from_intent(id, &goal) {
@@ -662,14 +831,29 @@ impl ManagedSimSquad {
         // Out-of-room members are excluded from the combat brain (they travel/flee above), so the squad
         // decision reflects the PRESENT in-room force (matching live, where crossed members HOLD and only
         // the in-room subset runs `decide_squad`).
+        // FULL-ROSTER member views (WS-VAL parity fix, audit H5): live builds `member_views` from
+        // the ENTIRE living roster wherever each member stands — the earlier in-room-only scoping
+        // here was a live↔sim divergence (its comment claimed live parity; the audit refuted it)
+        // AND the border-crossing livelock root: the first member through the open column decided
+        // the squad's fate ALONE (1-vs-campers ⇒ Retreating ⇒ bounce back ⇒ state decay ⇒ release
+        // ⇒ next member bounces — ping-pong forever). With the full roster the assessment sees
+        // 8-vs-2 and stays committed while the bloc funnels through. Execution stays scoped: an
+        // out-of-room member contributes to the DECISION but emits no combat/squad-move intents
+        // (its movement is the travel arm's; the kernel's V-1 filter already excludes it from
+        // per-member goals).
         let living: Vec<(CreepId, usize)> = self
             .members
             .iter()
-            .filter(|&&id| in_objective_room(id))
             .filter_map(|&id| sim.friend_index(id).map(|fi| (id, fi)))
             .collect();
-        if living.is_empty() {
+        let any_in_room = living.iter().any(|&(id, _)| in_objective_room(id));
+        if living.is_empty() || !any_in_room {
             // No in-room members — only travellers/fleers this tick. Resolve them and return (no combat).
+            // STATE DECAY (WS-VAL crossing fix): with nobody in the objective room there is nothing to
+            // retreat FROM — a latched `Retreating` here deadlocked the whole squad forever after a
+            // vanguard withdrawal (the travel arm gates on it). Re-form, so the (gated, bloc) crossing
+            // resumes once the squad regroups.
+            self.state = SquadOrderState::Forming;
             let mut intents = Intents::new();
             for (id, dir) in resolve_moves_via_system_with(
                 world,
@@ -679,6 +863,7 @@ impl ManagedSimSquad {
                 &self.mover_config,
             ) {
                 intents.set_move(id, dir);
+            if std::env::var("SQ_DEBUG").is_ok() { eprintln!("  resolved #{} -> {:?}", id, dir); }
             }
             return intents;
         }
@@ -786,6 +971,9 @@ impl ManagedSimSquad {
             MAX_KITE_OPS,
         );
         self.state = decision.state;
+        if std::env::var("SQ_DEBUG").is_ok() {
+            eprintln!("[sq {} ] state={:?} focus={:?} goals={:?}", self.owner, decision.state, decision.focus.map(|f| (f.pos.room_name(), f.pos.x().u8(), f.pos.y().u8(), f.id.is_some())), decision.member_goals.iter().map(|g| g.map(|p| (p.x().u8(), p.y().u8()))).collect::<Vec<_>>());
+        }
 
         let squad_dto = SquadStateDto {
             center: decision.center.unwrap_or(self.objective),
@@ -799,6 +987,12 @@ impl ManagedSimSquad {
         // in-room fighters + crossed members — resolves in ONE traffic-managed pass, like live.
         let mut move_reqs: Vec<SimMoveRequest> = std::mem::take(&mut travel_reqs);
         for (idx, &(member_id, fi)) in living.iter().enumerate() {
+            // Out-of-room member: in the VIEW (full-roster assessment, H5 parity) but not in the
+            // EXECUTION — its movement is the travel arm's (already requested above), and it can
+            // neither fight nor heal across a room boundary.
+            if !in_objective_room(member_id) {
+                continue;
+            }
             let heal_target = decision
                 .heal_assignments
                 .iter()
@@ -827,6 +1021,17 @@ impl ManagedSimSquad {
             let mut member_dto = squad_dto.clone();
             if let Some(goal) = decision.member_goals.get(idx).copied().flatten() {
                 member_dto.movement = SquadMovement::Advance { goal, range: 0 };
+            }
+            // WS-VAL rout discipline (Phase 4.5 items 2/3): a RETREATING squad with a rally
+            // withdraws THE WAY IT CAME — toward the staging/entry point — instead of following
+            // the local anti-threat gradient into whatever corner is farthest from the enemy
+            // (the observed NW corner rout: survivors fled deeper into the room and died under
+            // the tower's room-wide 150 floor). The mover's threat-weighted matrix still shapes
+            // the path around kill zones; rally-less beds keep the legacy kite goal.
+            if decision.state == SquadOrderState::Retreating {
+                if let Some(rally) = self.rally {
+                    member_dto.movement = SquadMovement::Advance { goal: rally, range: 3 };
+                }
             }
             let view_i = sim.view_for_with(fi, &member_dto, orders);
 
@@ -875,7 +1080,12 @@ impl ManagedSimSquad {
                 if matches!(decision.state, SquadOrderState::Engaged)
                     && decision.cohesion_radius > 0
                 {
-                    if let Some(center) = decision.center {
+                    // ROOM GATE (WS-VAL border fix): with the full-roster view (H5 parity) a
+                    // mid-crossing squad's centroid sits in the STAGING room — anchoring a
+                    // fight-room member to a cross-room point rejects its every move (watched:
+                    // the entrant trio at x=49 emitted inward goals each tick and the resolver
+                    // denied them all). Anchor only members in the centroid's own room.
+                    if let Some(center) = decision.center.filter(|c| c.room_name() == sim.friends()[fi].pos.room_name()) {
                         req = req.with_anchor(center, decision.cohesion_radius);
                     }
                 }
@@ -896,6 +1106,11 @@ impl ManagedSimSquad {
         // tile explicitly at `Immovable` (see `push_hold_requests`), and persistent doomed goals
         // onto held tiles convert to stands after a grace (the dance damper).
         push_hold_requests(world, &self.members, &mut move_reqs);
+        if std::env::var("SQ_DEBUG").is_ok() {
+            for r in &move_reqs {
+                if let screeps_sim_core::SimMoveGoal::To { target, range } = &r.goal { eprintln!("  req #{} to({},{},{}) r{} prio={:?}", r.creep, target.room_name(), target.x().u8(), target.y().u8(), range, r.priority); }
+            }
+        }
         convert_persistent_doomed_goals(world, &mut move_reqs, &mut self.doomed_streaks);
         // ONE traffic-managed pass for the whole squad (rover MovementSystem + resolver), like live.
         for (id, dir) in resolve_moves_via_system_with(
@@ -906,6 +1121,7 @@ impl ManagedSimSquad {
             &self.mover_config,
         ) {
             intents.set_move(id, dir);
+            if std::env::var("SQ_DEBUG").is_ok() { eprintln!("  resolved #{} -> {:?}", id, dir); }
         }
         intents
     }
