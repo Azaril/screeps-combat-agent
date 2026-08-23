@@ -705,6 +705,11 @@ impl ManagedSimSquad {
 
         // Stalemate tracking: total alive ENEMY hits this tick; no decrease for STALL_LIMIT ticks ⇒ a
         // standoff we're not closing → report enemy_stalled (the Destroy disengage; Hold ignores it).
+        // FU2 (mirrors `squad_manager::advance_enemy_stall` — live parity): both streaks advance ONLY
+        // on ENGAGED ticks and FREEZE otherwise — a recovery retreat must neither latch a stall (the
+        // kernel's re-engage veto would then deadlock a winning fight that dipped out of tower range)
+        // nor release a latched one (which would re-open the period-2 disengage oscillation).
+        let stall_engaged = self.state == SquadOrderState::Engaged;
         let enemy_hits: u32 = sim
             .hostiles()
             .iter()
@@ -712,19 +717,28 @@ impl ManagedSimSquad {
             .map(|h| h.hits)
             .sum();
         match self.prev_enemy_hits {
-            Some(prev) if enemy_hits >= prev => {
-                self.stall_ticks = self.stall_ticks.saturating_add(1)
+            // A decrease resets in ANY state — a kiting/parting-shot retreat that lands damage is
+            // real headway (mirrors `advance_enemy_stall`).
+            Some(prev) if enemy_hits < prev => {
+                self.stall_ticks = 0;
+                self.prev_enemy_hits = Some(enemy_hits);
             }
-            _ => self.stall_ticks = 0,
+            // Flat-or-up grows the streak ONLY while engaged; frozen (prev kept stale) otherwise.
+            Some(_) if stall_engaged => {
+                self.stall_ticks = self.stall_ticks.saturating_add(1);
+                self.prev_enemy_hits = Some(enemy_hits);
+            }
+            Some(_) => {}
+            None => self.prev_enemy_hits = Some(enemy_hits), // first reading seeds without accrual
         }
-        self.prev_enemy_hits = Some(enemy_hits);
         let enemy_stalled = self.stall_ticks >= STALL_LIMIT;
 
         // REC-062 — the STRUCTURE twin: total hits of the hostile structures; no decrease for
-        // STALL_LIMIT ticks ⇒ no raze headway → report structure_stalled. Same cadence/reset rule as the
-        // enemy tracker above (grow while flat-or-up, reset on any decrease), so the harmless-turtle
-        // disengage fires only when NEITHER creeps NOR structures are moving (an un-razable turtle) and
-        // NOT during a slow raze (dropping hits reset the streak). Mirrors `squad_manager` (live parity).
+        // STALL_LIMIT ticks ⇒ no raze headway → report structure_stalled. Same cadence/reset/freeze rule
+        // as the enemy tracker above (grow while flat-or-up on engaged ticks, reset on any decrease,
+        // frozen while not engaged), so the harmless-turtle disengage fires only when NEITHER creeps NOR
+        // structures are moving (an un-razable turtle) and NOT during a slow raze (dropping hits reset
+        // the streak). Mirrors `squad_manager` (live parity).
         let structure_hits: u32 = sim
             .structures()
             .iter()
@@ -732,12 +746,17 @@ impl ManagedSimSquad {
             .map(|s| s.hits)
             .sum();
         match self.prev_structure_hits {
-            Some(prev) if structure_hits >= prev => {
-                self.structure_stall_ticks = self.structure_stall_ticks.saturating_add(1)
+            Some(prev) if structure_hits < prev => {
+                self.structure_stall_ticks = 0;
+                self.prev_structure_hits = Some(structure_hits);
             }
-            _ => self.structure_stall_ticks = 0,
+            Some(_) if stall_engaged => {
+                self.structure_stall_ticks = self.structure_stall_ticks.saturating_add(1);
+                self.prev_structure_hits = Some(structure_hits);
+            }
+            Some(_) => {}
+            None => self.prev_structure_hits = Some(structure_hits),
         }
-        self.prev_structure_hits = Some(structure_hits);
         let structure_stalled = self.structure_stall_ticks >= STALL_LIMIT;
 
         let view = SquadView {
