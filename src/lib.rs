@@ -65,7 +65,6 @@ fn ownership(owner: Option<PlayerId>, me: PlayerId) -> Ownership {
 /// previously hand-rolled its stamps from raw world state (boosted power, every tower regardless of
 /// owner/energy, no rampart cover) and diverged from the decision-path field built from DTOs; one
 /// DTO pipeline ends the fork.
-#[allow(dead_code)] // consumer = the QUEUED sim-traversal-field delegation (tracker Phase 4.5 item 5 tail)
 pub(crate) fn room_combat_dtos(
     world: &CombatWorld,
     room: RoomName,

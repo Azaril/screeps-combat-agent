@@ -8,9 +8,9 @@
 
 use screeps::local::LocalCostMatrix;
 use screeps::{Direction, Position, RoomName};
-use screeps_combat_decision::kite::{KiteThreat, KiteTower, ThreatField, ThreatKind};
+use screeps_combat_decision::kite::ThreatField;
 use screeps_combat_decision::CombatIntent;
-use screeps_combat_engine::{CombatWorld, CreepId, PlayerId, SimBodyCombat};
+use screeps_combat_engine::{CombatWorld, CreepId, PlayerId};
 use screeps_rover::{
     ConstructionSiteCostMatrixCache, CostMatrixCache, CostMatrixDataSource, CostMatrixOptions,
     CostMatrixSystem, CostMatrixWrite, CreepCostMatrixCache, LinearCostMatrix, LocalPathfinder,
@@ -37,30 +37,17 @@ const THREAT_PATH_DIV: i32 = 150;
 const THREAT_PATH_CAP: i32 = 8;
 
 /// The in-room incoming-hits field from `me_owner`'s hostiles + towers (the same [`ThreatField`] the
-/// kite scorer uses) — the source of the threat-weighted path cost. Only `attack_power`/`ranged_power`/
-/// tower position feed the stamp, so `kind`/`reach`/`step_ticks` are dummies here.
+/// kite scorer uses) — the source of the threat-weighted path cost.
 fn room_threat_field(world: &CombatWorld, room: RoomName, me_owner: PlayerId) -> ThreatField {
-    let threats: Vec<KiteThreat> = world
-        .movement
-        .creeps
-        .iter()
-        .filter(|c| c.is_alive() && c.owner != me_owner && c.pos.room_name() == room)
-        .map(|c| KiteThreat {
-            pos: c.pos,
-            kind: ThreatKind::MeleeOnly,
-            reach: 0,
-            step_ticks: None,
-            attack_power: c.body.attack_power(),
-            ranged_power: c.body.ranged_attack_power(),
-        })
-        .collect();
-    let towers: Vec<KiteTower> = world
-        .towers
-        .iter()
-        .filter(|t| t.is_alive() && t.pos.room_name() == room)
-        .map(|t| KiteTower { pos: t.pos })
-        .collect();
-    ThreatField::build(&threats, &towers)
+    // WS-VAL parity item 5 (audit H1/H2/M3/M8): delegate to the SHARED `build_room_threat_field`
+    // over the same DTO views live feeds it. One substitution makes the traversal field cover-aware
+    // (own maintained ramparts = the safe corridor — H1), tower-gated by ownership AND energy
+    // (own/drained towers no longer stamp — H2/M8), and unboosted-stamped (the ThreatField v1
+    // contract; the hand-rolled stamps priced boosted routes up to 4× live — M3). Traversal and
+    // decision-path fields are now the same field. Landed AFTER the drain rework (drain-aware
+    // placement + deliverable standoff) de-luckified the drain canary this change used to flip.
+    let (hostiles, structures) = crate::room_combat_dtos(world, room, me_owner);
+    screeps_combat_decision::build_room_threat_field(&hostiles, &structures)
 }
 
 /// Per-tile additive-applied threat cost for `room`: for every tile the field covers (and that isn't a
@@ -132,6 +119,9 @@ impl CombatCostSource {
             .structures
             .iter()
             .filter(|s| s.is_alive() && s.pos.room_name() == room)
+            // WS-VAL parity M2: OWN ramparts are WALKABLE live (screeps_impl: my/public → None) —
+            // blanket-blocking them made the T-DEF-1 cover corridor unreachable in every sim path.
+            .filter(|s| !(s.kind == screeps_combat_engine::StructureKind::Rampart && s.owner == Some(me_owner)))
         {
             blockers.push((s.pos.x().u8(), s.pos.y().u8()));
         }
@@ -356,6 +346,10 @@ impl CombatWorldCostSource {
     fn from_world(world: &CombatWorld, me_owner: PlayerId) -> Self {
         let mut rooms: HashMap<RoomName, RoomObstacles> = HashMap::new();
         for s in world.structures.iter().filter(|s| s.is_alive()) {
+            // WS-VAL parity M2: own ramparts walkable (see CombatCostSource — same live rule).
+            if s.kind == screeps_combat_engine::StructureKind::Rampart && s.owner == Some(me_owner) {
+                continue;
+            }
             rooms
                 .entry(s.pos.room_name())
                 .or_default()
