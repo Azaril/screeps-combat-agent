@@ -307,7 +307,9 @@ pub fn move_request_from_intent(creep: CreepId, intent: &CombatIntent) -> Option
                 threats: from.clone(),
                 range: *range as u32,
             },
-            priority: MovementPriority::Normal,
+            // Parity M12 (2026-08-24): live's `MovementRequest::flee` is High for EVERY fleer
+            // (healer included) - the old Normal here let sim support flee below ordinary traffic.
+            priority: MovementPriority::High,
             // Kernel defaults (byte-identical): no numeric-priority bid, run-config ladder.
             priority_value: None,
             shove: true,

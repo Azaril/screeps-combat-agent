@@ -1073,9 +1073,13 @@ impl ManagedSimSquad {
                     req = req.with_priority(MovementPriority::High);
                 }
                 // §D5.4 decision-9 gate seam: a numeric bid (if configured) overrides the enum
-                // tier for resolver ORDERING (the enum stays the anchor fallback).
+                // tier for resolver ORDERING (the enum stays the anchor fallback). MoveTo ONLY
+                // (parity M12, 2026-08-24): live confines the bid to MoveTo — "flee keeps its
+                // own semantics" — so a sim flee must not carry it either.
                 if let Some(&bid) = self.priority_bids.get(&member_id) {
-                    req = req.with_priority_value(bid);
+                    if !matches!(mv_intent, CombatIntent::Flee { .. }) {
+                        req = req.with_priority_value(bid);
+                    }
                 }
                 // REC-055 flee-shove alignment: live's `MovementRequest::flee` withdraws with shoving OFF
                 // (`allow_shove=false` — a fleeing creep gets out, it does not shove teammates), so a sim
