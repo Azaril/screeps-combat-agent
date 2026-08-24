@@ -847,6 +847,10 @@ impl ManagedSimSquad {
             .filter_map(|&id| sim.friend_index(id).map(|fi| (id, fi)))
             .collect();
         let any_in_room = living.iter().any(|&(id, _)| in_objective_room(id));
+        if std::env::var("SQ_DEBUG2").is_ok() {
+            let hp: Vec<String> = living.iter().map(|&(id, fi)| { let f = &sim.friends()[fi]; format!("#{}@({},{}):{}", id, f.pos.x().u8(), f.pos.y().u8(), f.hits) }).collect();
+            eprintln!("[hp {} ] {}", self.owner, hp.join(" "));
+        }
         if living.is_empty() || !any_in_room {
             // No in-room members — only travellers/fleers this tick. Resolve them and return (no combat).
             // STATE DECAY (WS-VAL crossing fix): with nobody in the objective room there is nothing to
@@ -972,7 +976,7 @@ impl ManagedSimSquad {
         );
         self.state = decision.state;
         if std::env::var("SQ_DEBUG").is_ok() {
-            eprintln!("[sq {} ] state={:?} focus={:?} goals={:?}", self.owner, decision.state, decision.focus.map(|f| (f.pos.room_name(), f.pos.x().u8(), f.pos.y().u8(), f.id.is_some())), decision.member_goals.iter().map(|g| g.map(|p| (p.x().u8(), p.y().u8()))).collect::<Vec<_>>());
+            eprintln!("[sq {} ] state={:?} mv={:?} goals={}", self.owner, decision.state, decision.movement, decision.member_goals.iter().filter(|g| g.is_some()).count());
         }
 
         let squad_dto = SquadStateDto {
@@ -1047,6 +1051,7 @@ impl ManagedSimSquad {
                 .filter_map(|ci| to_engine_action(ci, &sim))
                 .collect();
             if !actions.is_empty() {
+            if std::env::var("SQ_DEBUG").is_ok() && !actions.is_empty() { eprintln!("  act #{} {:?}", member_id, actions); }
                 intents.set(member_id, actions);
             }
             // The squad's movement is the highest-priority movement intent (`decide_movement` returns

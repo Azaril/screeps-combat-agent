@@ -59,6 +59,55 @@ fn ownership(owner: Option<PlayerId>, me: PlayerId) -> Ownership {
     }
 }
 
+/// Room-scoped DTO views for the TRAVERSAL threat field (WS-VAL parity item 5): the hostile creeps
+/// and ALL structures (with ownership + tower energy) of one room, as `me_owner` sees them — the
+/// exact inputs `screeps_combat_decision::build_room_threat_field` takes. The sim's traversal field
+/// previously hand-rolled its stamps from raw world state (boosted power, every tower regardless of
+/// owner/energy, no rampart cover) and diverged from the decision-path field built from DTOs; one
+/// DTO pipeline ends the fork.
+#[allow(dead_code)] // consumer = the QUEUED sim-traversal-field delegation (tracker Phase 4.5 item 5 tail)
+pub(crate) fn room_combat_dtos(
+    world: &CombatWorld,
+    room: RoomName,
+    me_owner: PlayerId,
+) -> (Vec<CombatCreepDto>, Vec<CombatStructureDto>) {
+    let hostiles: Vec<CombatCreepDto> = world
+        .movement
+        .creeps
+        .iter()
+        .filter(|c| c.is_alive() && c.owner != me_owner && c.pos.room_name() == room)
+        .map(|c| creep_dto(c, synthetic_id(c.id)))
+        .collect();
+    let mut structures: Vec<CombatStructureDto> = world
+        .structures
+        .iter()
+        .filter(|s| s.is_alive() && s.pos.room_name() == room)
+        .map(|s| CombatStructureDto {
+            pos: s.pos,
+            structure_type: structure_type(s.kind),
+            hits: s.hits,
+            hits_max: s.hits_max,
+            ownership: ownership(s.owner, me_owner),
+            energy: 0,
+        })
+        .collect();
+    structures.extend(
+        world
+            .towers
+            .iter()
+            .filter(|t| t.is_alive() && t.pos.room_name() == room)
+            .map(|t| CombatStructureDto {
+                pos: t.pos,
+                structure_type: StructureType::Tower,
+                hits: t.hits,
+                hits_max: t.hits_max,
+                ownership: ownership(Some(t.owner), me_owner),
+                energy: t.energy,
+            }),
+    );
+    (hostiles, structures)
+}
+
 fn creep_dto(c: &SimCreep, raw: RawObjectId) -> CombatCreepDto {
     let body = (0..c.body.parts.len())
         .map(|i| {
