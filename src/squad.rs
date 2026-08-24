@@ -908,7 +908,28 @@ impl ManagedSimSquad {
         // on ENGAGED ticks and FREEZE otherwise — a recovery retreat must neither latch a stall (the
         // kernel's re-engage veto would then deadlock a winning fight that dipped out of tower range)
         // nor release a latched one (which would re-open the period-2 disengage oscillation).
-        let stall_engaged = self.state == SquadOrderState::Engaged;
+        // ... AND IN CONTACT (item-8a honest-verdict finding, 2026-08-24): a squad is only
+        // evidence of a STALEMATE when it could be making headway — some living member within
+        // weapon reach (3) of a hostile creep or structure. The sim's Engaged state begins at
+        // FOCUS SELECTION (any distance), so the clock used to accrue through the border gather +
+        // the march: 40 out-of-contact "Engaged" ticks tripped the harmless-turtle disengage
+        // 10+ tiles from a bare core, and the squad period-2 flapped Engaged↔Retreating at the
+        // room edge to timeout (border g1@T3, gate-traced: bal=1000, everything healthy, only the
+        // stall term firing). Out-of-contact reach problems are the TRAVEL budgets' jurisdiction.
+        let in_contact = {
+            let member_pos: Vec<Position> = self
+                .members
+                .iter()
+                .filter_map(|&id| sim.friend_index(id).map(|fi| sim.friends()[fi].pos))
+                .collect();
+            member_pos.iter().any(|p| {
+                sim.hostiles().iter().any(|h| h.hits > 0 && p.get_range_to(h.pos) <= 3)
+                    || sim.structures().iter().any(|s| {
+                        s.ownership == screeps_combat_decision::Ownership::Hostile && s.hits > 0 && p.get_range_to(s.pos) <= 3
+                    })
+            })
+        };
+        let stall_engaged = self.state == SquadOrderState::Engaged && in_contact;
         let enemy_hits: u32 = sim
             .hostiles()
             .iter()
