@@ -261,13 +261,13 @@ fn convert_persistent_doomed_goals(
         if !held.contains(&target) {
             continue;
         }
-        let adjacent = world
+        let Some(pos) = world
             .movement
             .creeps
             .iter()
             .find(|c| c.id == req.creep && c.is_alive())
-            .map(|c| (c.pos, c.pos.get_range_to(target) <= 1));
-        let Some((pos, true)) = adjacent else {
+            .map(|c| c.pos)
+        else {
             continue;
         };
         let streak = match streaks.get(&req.creep) {
@@ -276,6 +276,10 @@ fn convert_persistent_doomed_goals(
         };
         streaks.insert(req.creep, (target, streak));
         doomed_now.insert(req.creep);
+        // DISTANT doomed requesters are damped too (RULING-9 batch): a request whose destination
+        // is a squadmate's Immovable hold is un-completable at ANY range, and walking toward it
+        // ping-pongs path segments. Same grace as adjacent — the streak resets the moment the
+        // goal changes or the holder vacates, so real corridor queues pass through untouched.
         if streak >= DOOMED_GOAL_HOLD_AFTER {
             *req = SimMoveRequest::move_to(req.creep, pos, 0)
                 .with_priority(MovementPriority::Immovable);
@@ -976,7 +980,7 @@ impl ManagedSimSquad {
         );
         self.state = decision.state;
         if std::env::var("SQ_DEBUG").is_ok() {
-            eprintln!("[sq {} ] state={:?} mv={:?} goals={}", self.owner, decision.state, decision.movement, decision.member_goals.iter().filter(|g| g.is_some()).count());
+            eprintln!("[sq {} ] state={:?} focus={:?} mv={} goals={}", self.owner, decision.state, decision.focus.map(|f| (f.pos.x().u8(), f.pos.y().u8(), f.id.is_some())), match &decision.movement { screeps_combat_decision::SquadMovement::Advance{..} => "Adv", screeps_combat_decision::SquadMovement::Kite{..} => "Kite", screeps_combat_decision::SquadMovement::Drain{..} => "Drain", screeps_combat_decision::SquadMovement::Hold => "Hold" }, decision.member_goals.iter().filter(|g| g.is_some()).count());
         }
 
         let squad_dto = SquadStateDto {
